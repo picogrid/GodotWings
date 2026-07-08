@@ -1,6 +1,7 @@
-; Default quadcopter (quad X) for GWMultirotorBody. ~0.7 kg 5" quad: 0.13 m arms,
-; 5:1 thrust/weight, realistic inertia (auto-estimated). Powerful and agile while
-; staying stable on ArduCopter's stock tune. Tune to taste, or assign your own.
+; Default quadcopter (quad X) for GWMultirotorBody — a ~0.7 kg 5" FPV freestyle
+; quad. Quadratic thrust curve (hover ≈ sqrt(1/TWR) ≈ 41% stick), quadratic
+; airframe drag, rotor H-force, inflow thrust washout, and a realistic
+; (centre-weighted) inertia so rotation is FPV-snappy. Tune to taste.
 [gd_resource type="Resource" script_class="GWMultirotorConfig" load_steps=2 format=3]
 
 [ext_resource type="Script" path="res://addons/godotwings/fdm/MultirotorConfig.gd" id="1"]
@@ -13,7 +14,26 @@ Iyy = 0.0
 Izz = 0.0
 arm_length = 0.13
 motor_count = 4
-thrust_to_weight = 5.0
-motor_time_const = 0.02
-yaw_torque_coeff = 0.06
-drag_coeff = 0.25
+thrust_to_weight = 6.0
+motor_time_const = 0.015
+motor_time_const_down = 0.03
+thrust_expo = 2.0
+yaw_torque_coeff = 0.02
+prop_pitch_speed = 50.0
+drag_coeff = 0.0
+drag_area = Vector3(0.02, 0.025, 0.035)
+rotor_drag_coeff = 0.08
+rate_damping = 0.004
+flap_moment_coeff = 0.004
+prop_radius = 0.0635
+ground_effect_gain = 1.0
+propwash_moment = 0.15
+propwash_speed = 4.0
+propwash_thrust_loss = 0.15
+batt_cells = 4
+batt_capacity_mah = 1300.0
+batt_max_current = 90.0
+batt_resistance = 0.025
+motor_variance = 0.015
+rotor_inertia = 1.5e-05
+rotor_max_speed = 2800.0

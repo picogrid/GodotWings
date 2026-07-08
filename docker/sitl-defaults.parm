@@ -64,9 +64,26 @@ MNT1_ROLL_MAX  30
 FRAME_CLASS 1
 FRAME_TYPE 1
 
-# GWMultirotorBody maps PWM -> thrust LINEARLY, so disable ArduCopter's thrust
-# curve and set hover = 1/thrust_to_weight (0.2 for the default 5:1 QuadX). A
-# mismatched THST_EXPO/HOVER makes the copter feel underpowered on takeoff and
-# mistunes the rate loop (effective gain varies with throttle -> tip/flip).
-MOT_THST_EXPO 0
-MOT_THST_HOVER 0.2
+# GWMultirotorBody commands rotor SPEED linearly with PWM and thrust goes with
+# omega^2 (QuadX.tres thrust_expo = 2.0), so ArduCopter's thrust linearisation
+# must be the full quadratic: MOT_THST_EXPO 1.0. Hover thrust fraction =
+# 1/thrust_to_weight (~0.17 at 6:1), and MOT_HOVER_LEARN refines it in flight
+# (the Godot battery model shifts it as the pack sags). A mismatched
+# THST_EXPO/HOVER mistunes the rate loop (gain varies with throttle -> tip/flip).
+# If you set thrust_expo = 1.0 (legacy linear) in Godot, use MOT_THST_EXPO 0.
+MOT_THST_EXPO 1.0
+MOT_THST_HOVER 0.17
+MOT_HOVER_LEARN 2
+FS_THR_ENABLE 0
+
+# Rate PIDs sized for the low-inertia 5" QuadX (see docker/fpv-quad.parm for the
+# derivation). ArduCopter's large-quad defaults (P=0.135) oscillate hard on it.
+ATC_RAT_RLL_P 0.02
+ATC_RAT_RLL_I 0.08
+ATC_RAT_RLL_D 0.0008
+ATC_RAT_PIT_P 0.02
+ATC_RAT_PIT_I 0.08
+ATC_RAT_PIT_D 0.0008
+ATC_RAT_YAW_P 0.09
+ATC_RAT_YAW_I 0.05
+INS_GYRO_FILTER 80

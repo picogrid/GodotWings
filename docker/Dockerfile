@@ -41,5 +41,6 @@ RUN ./waf configure --board sitl && ./waf plane && ./waf copter
 ENV PATH="/opt/ardupilot/Tools/autotest:${PATH}"
 
 COPY sitl-defaults.parm /sitl-defaults.parm
+COPY fpv-quad.parm /fpv-quad.parm
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

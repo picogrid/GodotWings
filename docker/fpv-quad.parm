@@ -1,0 +1,90 @@
+# GodotWings FPV acro quad — ArduCopter SITL tune matched to QuadX.tres.
+#
+# Use INSTEAD of sitl-defaults.parm (PARAM_FILE replaces it, so this file is
+# self-contained):
+#
+#   VEHICLE=ArduCopter PARAM_FILE=/fpv-quad.parm docker compose up
+#
+# Fly with a gamepad through the GCS: QGroundControl > Vehicle Setup > Joystick
+# (or MAVProxy `module load joystick`). Arm, switch to ACRO, fly. The Godot side
+# needs a GWMulticopter with the stock QuadX.tres (control_source = SITL).
+#
+# The two sides MUST agree:
+#   Godot QuadX.tres                     <->  this file
+#   thrust_expo        = 2.0  (T = w^2)  <->  MOT_THST_EXPO 1.0
+#   thrust_to_weight   = 6.0             <->  MOT_THST_HOVER ~1/6 (+ learn)
+#   control_rate_hz    = 400             <->  SCHED_LOOP_RATE 400
+#   acro_max_rate_dps  = 720 (manual FC) <->  ACRO_RP_RATE 720 (same feel)
+#   acro_yaw_rate_dps  = 540             <->  ACRO_Y_RATE 540
+
+# --- Simulator arming (no RC transmitter attached) ---------------------------
+ARMING_CHECK 0          # skip pre-arm checks (simulator only!)
+ARMING_RUDDER 2         # allow rudder arm/disarm
+FS_THR_ENABLE 0         # no RC failsafe in the sim
+DISARM_DELAY 0          # don't auto-disarm between throws
+
+# --- Frame: quad X, matches GWMultirotorBody's motor layout ------------------
+FRAME_CLASS 1
+FRAME_TYPE 1
+
+# --- Thrust model: EXACT match to the Godot physics --------------------------
+# GodotWings: PWM commands rotor speed linearly, thrust = speed^2 * max.
+# MOT_THST_EXPO 1.0 is that same square law, so ArduPilot's linearisation is
+# exact and the rate-loop gain is constant across the throttle range.
+MOT_THST_EXPO 1.0
+MOT_THST_HOVER 0.15     # 1/TWR / fresh-pack boost; hover-learn refines it
+MOT_HOVER_LEARN 2       # learn + save (Godot battery sag shifts it in-flight)
+MOT_SPIN_ARM 0.05
+MOT_SPIN_MIN 0.08       # idle authority in dives (air-mode-ish)
+MOT_SPOOL_TIME 0.25
+
+# --- Rate controller: validated closed-loop against the exact Godot plant ----
+# Tuned by simulating ArduCopter's Stabilize cascade (angle P -> rate PID ->
+# mixer, 1-tick lockstep delay, gyro LPF) against GWMultirotorBody: a 30-deg
+# tilt levels in ~0.45 s with <1 deg overshoot and zero oscillations across
+# P 0.008-0.06; these values sit mid-range for margin against EKF/filter lag.
+# Plant numbers: ~1980 rad/s^2 roll authority per unit mix, 15 ms motor pole,
+# yaw authority ~214 rad/s^2/mix.
+# NOTE if it wobbles or won't level: 99% the params never loaded — the parm
+# files are baked into the image, so run `docker compose up --BUILD` after any
+# edit, and verify in MAVProxy with `param show MOT_THST_EXPO` (must be 1.0).
+ATC_RAT_RLL_P 0.02
+ATC_RAT_RLL_I 0.08
+ATC_RAT_RLL_D 0.0008
+ATC_RAT_RLL_FLTD 40
+ATC_RAT_RLL_FLTT 40
+ATC_RAT_PIT_P 0.02
+ATC_RAT_PIT_I 0.08
+ATC_RAT_PIT_D 0.0008
+ATC_RAT_PIT_FLTD 40
+ATC_RAT_PIT_FLTT 40
+ATC_RAT_YAW_P 0.09
+ATC_RAT_YAW_I 0.05
+INS_GYRO_FILTER 80      # fast frame -> higher gyro LPF than the 20 Hz default
+SCHED_LOOP_RATE 400     # matches GWMultirotorBody control_rate_hz
+# Refine in-sim if you like: fly AltHold, switch to AUTOTUNE, let it finish,
+# then `param show ATC_RAT*` in MAVProxy and copy the results back here (the
+# container's eeprom does not survive a rebuild).
+
+# --- ACRO: FPV rates, no self-leveling ---------------------------------------
+ACRO_RP_RATE 720        # full-stick roll/pitch rate (deg/s)
+ACRO_Y_RATE 540         # full-stick yaw rate (deg/s)
+ACRO_RP_EXPO 0.3        # soft centre stick
+ACRO_Y_EXPO 0.3
+ACRO_TRAINER 0          # 0 = pure rate mode (no auto-level!)
+ACRO_BAL_ROLL 0
+ACRO_BAL_PITCH 0
+
+# --- Modes: boot into ACRO with a centred (or absent) mode switch ------------
+FLTMODE1 1
+FLTMODE2 1
+FLTMODE3 1
+FLTMODE4 1              # pwm 1491-1620: a centred/idle mode channel lands here
+FLTMODE5 2              # AltHold two notches up, as a rescue
+FLTMODE6 5              # Loiter at the top, as a rescue
+
+# --- Aux RC passthrough (catapult/switches visible in Godot; see defaults) ---
+SERVO5_FUNCTION  55
+SERVO6_FUNCTION  56
+SERVO7_FUNCTION  57
+SERVO8_FUNCTION  58
