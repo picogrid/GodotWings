@@ -1,0 +1,72 @@
+[gd_scene format=3 uid="uid://bgc05kfugrp36"]
+
+[ext_resource type="Script" uid="uid://btq25u4xs5gcj" path="res://addons/godotwings/Aircraft.gd" id="1_air"]
+[ext_resource type="Script" uid="uid://nwtamf4ieau" path="res://addons/godotwings/camera/GlobeCamera.gd" id="2_cam"]
+[ext_resource type="Script" uid="uid://by3asi3b53f6q" path="res://addons/godotwings/world/GeoReference.gd" id="3_geo"]
+[ext_resource type="Script" uid="uid://bsk60lj53g04y" path="res://addons/godotwings/world/Catapult.gd" id="4_cata"]
+
+[sub_resource type="Environment" id="Env"]
+background_mode = 1
+background_color = Color(0.48, 0.66, 0.86, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.62, 0.71, 0.85, 1)
+ambient_light_energy = 0.7
+tonemap_mode = 2
+
+[node name="GlobeFlight" type="Node3D" unique_id=824584454]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=331375474]
+environment = SubResource("Env")
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=960550529]
+transform = Transform3D(1, 0, 0, 0, 0.6427876, 0.76604444, 0, -0.76604444, 0.6427876, 0, 0, 0)
+
+[node name="CesiumGeoreference" type="CesiumGeoreference" parent="." unique_id=1624109784]
+ecefX = -4471571.441765009
+ecefY = 2669270.761974487
+ecefZ = -3671144.5230453997
+latitude = -35.36326100000089
+longitude = 149.16523
+altitude = 584.0000000074506
+transform = Transform3D(1, 0, 0, 0, -4.371139e-08, 1, 0, -1, -4.371139e-08, 0, 0, 0)
+
+[node name="Google Photorealistic 3D Tiles" type="Cesium3DTileset" parent="CesiumGeoreference" unique_id=1558414003]
+maximum_simultaneous_tile_loads = 200
+forbid_holes = true
+create_physics_meshes = false
+ion_asset_id = 2275207
+transform = Transform3D(1, 0, 0, 0, -4.371139e-08, -1, 0, 1, -4.371139e-08, 0, 0, 0)
+
+[node name="GWGeoReference" type="Node" parent="." unique_id=115038289]
+script = ExtResource("3_geo")
+anchor_path = NodePath("../Anchor")
+drive_tile_streaming = false
+
+[node name="GWGlobeCamera" type="Camera3D" parent="." unique_id=275540151 node_paths=PackedStringArray("globe_node", "tilesets")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 165, 30)
+script = ExtResource("2_cam")
+target_path = NodePath("../Anchor/GWAircraft")
+distance = 16.0
+globe_node = NodePath("../CesiumGeoreference")
+tilesets = [NodePath("../CesiumGeoreference/Google Photorealistic 3D Tiles")]
+
+[node name="Anchor" type="Node3D" parent="." unique_id=1617289193]
+
+[node name="GWAircraft" type="Node3D" parent="Anchor" unique_id=1339376189]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 160, 0)
+script = ExtResource("1_air")
+model_yaw_offset_deg = 180.0
+enable_camera = true
+camera_protocol = 1
+control_source = 1
+spawn_altitude = 150.0
+hold_until_launch = true
+terrain_following = true
+
+[node name="GWCatapult" type="Node3D" parent="." unique_id=959692918]
+script = ExtResource("4_cata")
+aircraft_path = NodePath("../Anchor/GWAircraft")
+launch_speed = 25.0
+trigger_channel = 3
+trigger_threshold = 0.4
+show_model = false

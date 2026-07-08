@@ -1,0 +1,22 @@
+[gd_scene format=3 uid="uid://ybibtjbm78va"]
+
+[ext_resource type="Script" uid="uid://hoei434a3awq" path="res://examples/phase0/GlobeFrameTest.gd" id="1_test"]
+[ext_resource type="Script" uid="uid://b0xrn32lgb2wt" path="res://addons/cesium_godot/scripts/camera_controllers/CesiumDynamicCamera.gd" id="2_nonqs"]
+
+[node name="GlobeFrameTest" type="Node3D" unique_id=1218054934]
+script = ExtResource("1_test")
+
+[node name="CesiumGeoreference" type="CesiumGeoreference" parent="." unique_id=625814843]
+transform = Transform3D(1, 0, 0, 0, -4.371139e-08, 1, 0, -1, -4.371139e-08, 0, 0, 0)
+
+[node name="Google Photorealistic 3D Tiles" type="Cesium3DTileset" parent="CesiumGeoreference" unique_id=2090887235]
+ion_asset_id = 2275207
+transform = Transform3D(1, 0, 0, 0, -4.371139e-08, -1, 0, 1, -4.371139e-08, 0, 0, 0)
+
+[node name="CesiumDynamicCam" type="Camera3D" parent="." unique_id=170070390 node_paths=PackedStringArray("globe_node", "tilesets")]
+transform = Transform3D(1, 0, 0, 0, 0.82821685, 0.56040776, 0, -0.56040776, 0.82821685, 0, 1.6968784, 1.8282868)
+script = ExtResource("2_nonqs")
+move_speed = 100000.0
+globe_node = NodePath("../CesiumGeoreference")
+tilesets = [NodePath("../CesiumGeoreference/Google Photorealistic 3D Tiles")]
+render_atmosphere = true
