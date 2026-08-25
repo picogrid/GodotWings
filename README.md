@@ -118,6 +118,166 @@ SERVO10_FUNCTION 6     # mount yaw   -> ch 10
 SERVO11_FUNCTION 8     # mount roll  -> ch 11
 ```
 
+## Ground PTZ (fixed pan/tilt/zoom camera)
+
+`GWGroundPTZ` (`sensors/GroundPTZ.gd`) is a ground-emplaced pan/tilt/zoom camera
+— a tripod/mast vantage, not attached to a vehicle. It reuses `GWCamera`
+verbatim for rendering + RTSP publish (auto-adding one as a child, configured
+from its own exports, on its own path/port) and only points that camera's
+mount and adjusts its `fov` for zoom. It does **not** speak any camera control
+protocol itself — that translation lives in an external process; Godot only
+renders, streams RTSP, and speaks a dumb JSON control protocol over TCP that
+drives it.
+
+Drop a `GWGroundPTZ` node in the scene at the tripod/mast position (its own
+`position`, same as any other node) and set:
+
+| Export | Meaning |
+|---|---|
+| `reference_heading_deg` | Compass heading `pan = 0` points at. |
+| `base_fov` | `Camera3D.fov` at `zoom = 1` (widest); applied as `fov = base_fov / zoom`. |
+| `tilt_min_deg` / `tilt_max_deg` | Tilt clamp, degrees (positive = up, negative = down). |
+| `zoom_max` | Zoom is clamped to `[1, zoom_max]`. |
+| `max_pan_rate_deg` / `max_tilt_rate_deg` / `max_zoom_rate` | Rate at speed = 100 for `continuous` moves. |
+| `default_continuous_timeout` | Used when a `continuous` request omits `"timeout"`. |
+| `protocol`, `resolution`, `fps`, `video_host`, `video_port`, `rtsp_url`, `ffmpeg_path`, `launch_ffmpeg`, `bitrate_kbps`, `raw_tcp_port` | Passed straight through to the child `GWCamera` — same meaning as the vehicle camera's own exports; give `rtsp_url` its own path (e.g. `.../groundptz`) so it doesn't collide with a vehicle's stream. |
+| `control_host` / `control_port` | Bind address for the JSON control socket (default `0.0.0.0:8770`). |
+| `metadata_enabled`, `metadata_host`, `metadata_port` | Off by default. When on, emits one JSON telemetry packet/frame over UDP — pose + geodetic position, for `gw_klv_muxer.py` (below) or your own tooling. |
+| `latitude`, `longitude`, `altitude_m` | The mount's true WGS84 position — purely informational (doesn't affect rendering), but required for the telemetry to be geolocatable. |
+
+To pre-configure the camera yourself (custom encoder settings, etc.), add a
+`GWCamera` child under the `GWGroundPTZ` by hand — it'll be reused as-is
+instead of auto-created.
+
+### JSON control protocol
+
+One TCP connection, newline-delimited JSON: one request object per line, one
+reply object back per request (`continuous`/`stop` aside, this is otherwise
+stateless). Angles are degrees; `pan` wraps to `[-180, 180]` (it's a full-
+rotation yaw), `tilt`/`zoom` hard-clamp to their configured ranges. Every
+successful reply echoes the resulting pose so the caller can read state
+straight off any command. Errors reply `{"ok":false,"error":"..."}`.
+
+```
+{"cmd":"status"}
+    -> {"ok":true,"pan":P,"tilt":T,"zoom":Z}
+
+{"cmd":"absolute","pan":P,"tilt":T,"zoom":Z}       // any field optional; missing = unchanged
+    -> {"ok":true,"pan":P,"tilt":T,"zoom":Z}
+
+{"cmd":"relative","rpan":dP,"rtilt":dT,"rzoom":dZ} // deltas, any optional
+    -> {"ok":true,"pan":P,"tilt":T,"zoom":Z}
+
+{"cmd":"continuous","pan_speed":sx,"tilt_speed":sy,"zoom_speed":sz,"timeout":secs}
+    // speeds in [-100,100] (% of max rate); moves each physics tick until
+    // "stop" or timeout (default from `default_continuous_timeout`, 5s).
+    -> {"ok":true}
+
+{"cmd":"stop"}
+    // halts any continuous motion.
+    -> {"ok":true,"pan":P,"tilt":T,"zoom":Z}
+```
+
+See `examples/GroundPTZ.tscn` for a minimal scene.
+
+### STANAG 4609 / MISB ST 0601 KLV metadata
+
+`tools/gw_klv_muxer.py` is a companion process (not part of the addon) that
+turns either camera's raw video + telemetry into a proper STANAG 4609 stream —
+H.264 video and MISB ST 0601 KLV metadata as two elementary streams in one
+MPEG-TS, the standard FMV wire format. It's what you'd point `launch_ffmpeg =
+false` at instead of ffmpeg when you need KLV: ffmpeg's CLI can mux H.264 fine
+but can't cleanly interleave the variable-length, packet-boundary-sensitive
+KLV track (see `misb_st0601.py`'s docstring for why), so this uses GStreamer
+instead — `mpegtsmux` has native KLV support (`meta/x-klv` caps → the
+`stream_type 0x06` + `KLVA` registration descriptor MISB readers expect).
+
+```bash
+pip install pygobject   # or: brew install gstreamer pygobject3 (macOS)
+python3 tools/gw_klv_muxer.py --video-port 5568 --metadata-port 5611 \
+    --width 1280 --height 720 --fps 30 --out-port 5700
+```
+
+By default it publishes plain UDP MPEG-TS. Pass `--rtsp-url` instead to push
+to an RTSP server (e.g. the same MediaMTX `GWCamera`'s own `rtsp_url` already
+targets, on its own path) — the H.264+KLV mux is reused completely unchanged;
+only the transport at the very end swaps from `udpsink` to `rtspclientsink`
+(RTP/MP2T, payload type 33 — the KLV stays inside the MPEG-TS exactly as
+`mpegtsmux` built it, since RTSP has no KLV media type of its own to describe
+it separately):
+
+```bash
+python3 tools/gw_klv_muxer.py --video-port 5568 --metadata-port 5611 \
+    --width 1280 --height 720 --fps 30 --rtsp-url rtsp://127.0.0.1:8554/groundptz_klv
+```
+
+Two things worth knowing if a downstream tool complains about the stream:
+
+- **`h264parse config-interval=-1`** repeats SPS/PPS before every IDR frame
+  (not on a fixed timer) — needed for anything joining mid-stream (an RTSP
+  server ingesting the push, a client connecting after start) to decode from
+  its first keyframe. The "non-existing PPS" warning right when something
+  *first* joins mid-GOP is still normal and expected either way — every
+  decoder has to wait for the next IDR when joining mid-stream, no setting
+  changes that; it should clear up as soon as that next IDR arrives.
+- **`mpegtsmux latency` (`--mux-latency-ms`, default 200)** — the KLV appsrc
+  has near-zero latency; the video branch has to actually run through
+  `x264enc` first. Without this, `mpegtsmux` can commit to its very first
+  PAT/PMT before the video branch has produced anything, so that first table
+  declares only the KLV track — and readers that read the PMT once at start
+  (MediaMTX's UDP source among them) latch onto that and reject all
+  subsequent video as an "undeclared track", even though a corrected PMT
+  arrives ~100ms later. Verified directly: `0` (disabled) reliably reproduces
+  exactly that failure; `200` reliably fixes it. Raise it if your video branch
+  is slower to start (bigger resolution/bitrate, slower machine).
+
+It auto-detects which camera's telemetry arrived — `GWCamera`'s (vehicle-
+relative pose + `pos_ned`/quaternion, converted to lat/lon via the same flat-
+tangent-plane math as `GWGeoReference.ned_to_geodetic()`; pass `--home-lat` /
+`--home-lon` / `--home-alt` to match) or `GWGroundPTZ`'s (already absolute
+lat/lon + pan/tilt/zoom) — and maps it onto the ST 0601 tags each schema can
+actually populate: platform heading/pitch/roll, sensor lat/lon/altitude
+(correctly accounting for the camera's mount offset *and* any gimbal rotation
+— not just the vehicle's CG position and attitude), sensor relative az/el,
+horizontal/vertical FOV, and a frame-center + 4-corner ground footprint. Point
+any FMV/KLV client (or `gst-launch-1.0 udpsrc port=5700 ! tsdemux ! ...`) at
+the resulting `udp://host:5700`.
+
+The frame-center/corner tags (23-25, 82-89) come from a **flat-ground-plane**
+ray intersection — the boresight and 4 FOV-corner rays intersected with a
+horizontal plane at `--ground-alt` (default 0). This is a simplifying
+approximation, **not** a real terrain raycast: Godot has the actual terrain
+mesh, but this external process doesn't, so it can't ray-cast against it.
+Over genuinely flat ground it's exact; over hills it's off by however much the
+terrain deviates from that plane. If the camera is looking at or above the
+horizon, no footprint can exist — those tags are simply omitted for that
+frame rather than emitting nonsense.
+
+With every field this module can populate, the packet is small enough for
+BER's single-byte ("short-form") length encoding — except with all 9
+frame-center/corner tags added, which pushes it past 127 bytes into
+multi-byte ("long-form") length. That's valid KLV, but some simpler KLV
+parsers only handle short-form and will error loading tags on a long-form
+packet. If your downstream tool complains, pass `--no-footprint` to drop
+those 9 tags and check whether that's the cause.
+
+**Testing it end to end**, with no real STANAG4609 client on hand: set
+`launch_ffmpeg = false` on the camera (Godot then only hosts the raw-frame
+socket instead of spawning its own ffmpeg), run `gw_klv_muxer.py` against it
+as above, then in parallel:
+
+```bash
+ffplay udp://127.0.0.1:5700            # see the actual video
+ffprobe udp://127.0.0.1:5700           # confirm it lists a video AND a data stream
+python3 tools/gw_klv_dump.py --port 5700   # decode + print every KLV packet live
+```
+
+`gw_klv_dump.py` scans the stream for genuine, checksum-valid KLV units and
+prints each one's decoded fields as they arrive — the quickest way to watch
+lat/lon/pan/tilt update in real time as you drive the camera over its JSON
+control socket, and hard confirmation the metadata survived the mux intact
+(a corrupted or misframed packet simply fails its checksum and gets skipped).
+
 ## Wind, collision & crash
 
 `GWWind` — drop one in the world and every vehicle auto-finds it. Mean wind

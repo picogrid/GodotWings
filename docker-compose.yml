@@ -21,7 +21,7 @@ services:
       # Where the ground station listens for MAVLink.
       GCS_HOST: ${GCS_HOST:-host.docker.internal}
       GCS_PORT: ${GCS_PORT:-14550}
-      HOME_LOCATION: ${HOME_LOCATION:--35.363261,149.165230,584,353}
+      HOME_LOCATION: ${HOME_LOCATION:-60.221088825593135,25.018208331290666,0,90}
       SPEEDUP: ${SPEEDUP:-1}
       # ArduPlane (default) or ArduCopter — match the Godot vehicle you fly.
       VEHICLE: ${VEHICLE:-ArduPlane}

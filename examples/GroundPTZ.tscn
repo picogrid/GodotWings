@@ -1,0 +1,40 @@
+[gd_scene format=3 uid="uid://c8j1nv6qgpt00"]
+
+[ext_resource type="Script" uid="uid://c46ixgpyye7s" path="res://addons/godotwings/sensors/GroundPTZ.gd" id="1_ptz"]
+
+[sub_resource type="BoxMesh" id="Mesh_ground"]
+size = Vector3(4000, 1, 4000)
+
+[sub_resource type="StandardMaterial3D" id="Mat_ground"]
+albedo_color = Color(0.22, 0.45, 0.16, 1)
+
+[sub_resource type="BoxMesh" id="Mesh_target"]
+size = Vector3(4, 4, 4)
+
+[sub_resource type="StandardMaterial3D" id="Mat_target"]
+albedo_color = Color(0.8, 0.2, 0.15, 1)
+
+[node name="GroundPTZExample" type="Node3D" unique_id=622915309]
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=1284687803]
+transform = Transform3D(0.7, -0.5, 0.5, 0, 0.7, 0.7, -0.7, -0.5, 0.5, 0, 200, 0)
+shadow_enabled = true
+
+[node name="Ground" type="MeshInstance3D" parent="." unique_id=1611832484]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+mesh = SubResource("Mesh_ground")
+surface_material_override/0 = SubResource("Mat_ground")
+
+[node name="Target" type="MeshInstance3D" parent="." unique_id=81458794]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2, -60)
+mesh = SubResource("Mesh_target")
+surface_material_override/0 = SubResource("Mat_target")
+
+[node name="GroundPTZ" type="Node3D" parent="." unique_id=92205693]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 3, 0)
+script = ExtResource("1_ptz")
+video_host = "localhost"
+video_port = 8999
+rtsp_url = "rtsp://localhost:8999/groundptz"
+launch_ffmpeg = false
+metadata_enabled = true

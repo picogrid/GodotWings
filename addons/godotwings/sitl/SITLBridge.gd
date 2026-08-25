@@ -203,6 +203,10 @@ func _build_json(s: Dictionary) -> PackedByteArray:
 		data["windvane"] = s["wind"]
 	if s.has("battery"):
 		data["battery"] = s["battery"]
+	if s.has("rangefinder"):
+		# ArduPilot JSON backend optional field: SITL rangefinder instance 1
+		# (meters). Feeds RNGFND1_TYPE=100 -> EK3 optical-flow height scaling.
+		data["rng_1"] = s["rangefinder"]
 
 	# Trailing newline so ArduPilot reliably detects the end of the frame.
 	return (JSON.stringify(data) + "\n").to_utf8_buffer()

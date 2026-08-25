@@ -71,6 +71,11 @@ const DEFAULT_MODEL_ORIENTATION := ModelOrientation.ONSHAPE_Z_UP
 @export var camera_fps: float = 30.0
 ## Camera mount relative to the body. Default: 1 m ahead of CG, looking out the nose.
 @export var camera_mount: Transform3D = Transform3D(Basis(), Vector3(0, 0.1, -1.0))
+## Off hands the raw-frame TCP server to your own pipeline instead of ffmpeg —
+## e.g. `tools/gw_klv_muxer.py` for STANAG4609/KLV FMV output (see the README's
+## "STANAG 4609 / MISB ST 0601 KLV metadata" section). `camera_protocol` /
+## `rtsp_url` etc. are then unused; only `resolution`/`fps` still apply.
+@export var camera_launch_ffmpeg: bool = true
 ## Make the camera an ArduPilot servo gimbal: it reads the mount servo PWM (set
 ## MNT1_TYPE=1 + SERVOn_FUNCTION on the autopilot) and follows every mount mode
 ## (MAVLink/ROI/Home/SysID/RC). See GWCamera for details.
@@ -161,6 +166,7 @@ func _camera_opts() -> Dictionary:
 	return {
 		"protocol": camera_protocol, "resolution": camera_resolution, "fps": camera_fps,
 		"mount": camera_mount, "instance": sitl_instance, "gimbal": camera_gimbal,
+		"launch_ffmpeg": camera_launch_ffmpeg,
 		"gimbal_pitch_channel": gimbal_pitch_channel, "gimbal_yaw_channel": gimbal_yaw_channel,
 		"gimbal_roll_channel": gimbal_roll_channel, "gimbal_pitch_range_deg": gimbal_pitch_range_deg,
 		"gimbal_yaw_range_deg": gimbal_yaw_range_deg, "gimbal_roll_range_deg": gimbal_roll_range_deg,

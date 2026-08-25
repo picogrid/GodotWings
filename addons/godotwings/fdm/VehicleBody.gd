@@ -603,7 +603,7 @@ func _ensure_manual_input() -> void:
 
 
 ## Add a GWCamera child configured from `opts` (no-op if one already exists). Keys:
-## protocol, resolution, fps, mount, instance, gimbal(bool) + gimbal_* passthrough.
+## protocol, resolution, fps, mount, instance, launch_ffmpeg, gimbal(bool) + gimbal_* passthrough.
 ## Per-vehicle ports auto-offset by `instance` so multiple vehicles don't collide.
 func _ensure_camera(opts: Dictionary) -> void:
 	for child in get_children():
@@ -619,6 +619,9 @@ func _ensure_camera(opts: Dictionary) -> void:
 	cam.video_port = 5600 + 2 * inst
 	cam.metadata_port = 5601 + 2 * inst
 	cam.raw_tcp_port = 5566 + inst
+	# false hands the raw-frame TCP server to your own pipeline instead of ffmpeg
+	# — e.g. tools/gw_klv_muxer.py for STANAG4609/KLV output (see the README).
+	cam.launch_ffmpeg = opts.get("launch_ffmpeg", true)
 	if opts.get("gimbal", false):
 		cam.gimbal_enabled = true
 		cam.gimbal_pitch_channel = opts.get("gimbal_pitch_channel", 0)
@@ -646,4 +649,10 @@ func _build_state() -> Dictionary:
 	}
 	if _wind != null and _wind.wind_speed > 0.0:
 		state["wind"] = _wind.windvane()
+	# Downward rangefinder (flat world at D=0): SITL's RNGFND1_TYPE=100
+	# driver reads JSON "rng_1"; without it the driver reports NoData and
+	# EK3 never starts optical-flow NAV aiding (measured 2026-08-04:
+	# vehicle at 27 m, RFND Dist 0.00/Stat 1 all flight, GUIDED refused
+	# "requires position"). Clamp: the sensor reads 0 when landed.
+	state["rangefinder"] = maxf(0.0, -_pos_ned.z)
 	return state

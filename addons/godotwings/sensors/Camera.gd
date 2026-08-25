@@ -27,8 +27,13 @@ enum Protocol {
 @export var enabled := true
 @export var resolution := Vector2i(1280, 720)
 @export var fps := 30.0
-## Vertical field of view in degrees.
-@export var fov := 70.0
+## Vertical field of view in degrees. Live-updatable (e.g. for zoom): assigning
+## after _ready() pushes straight to the render camera, no restart needed.
+@export var fov := 70.0:
+	set(v):
+		fov = v
+		if _cam != null:
+			_cam.fov = v
 ## Some platforms hand back a vertically-flipped readback; toggle if the feed is upside-down.
 @export var flip_v := false
 
@@ -108,7 +113,7 @@ func _ready() -> void:
 	_viewport.add_child(_cam)
 
 	_body = _resolve_body()
-	if _body == null:
+	if _body == null and metadata_enabled:
 		push_warning("GWCamera: no GWVehicleBody found; metadata pose will be zero.")
 
 	if not _server.listen(raw_tcp_port, "127.0.0.1") == OK:
@@ -302,6 +307,11 @@ func _send_metadata() -> void:
 		"fov_deg": fov,
 		"width": resolution.x,
 		"height": resolution.y,
+		# Static mount offset from the body origin (this node's own `transform.origin`
+		# — e.g. `camera_mount`'s translation), in the SAME Godot render-frame axes
+		# (+X body-right, +Y body-up, -Z body-forward) as `mount_basis` below — so a
+		# consumer can place the sensor exactly, not just the vehicle CG.
+		"mount_pos": [transform.origin.x, transform.origin.y, transform.origin.z],
 		# Camera orientation relative to the aircraft body (render frame), including
 		# the live gimbal rotation — so CV can recover world pointing as
 		# body_basis * mount_basis.
