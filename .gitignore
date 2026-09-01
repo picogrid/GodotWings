@@ -20,3 +20,11 @@ export_presets.cfg
 # Python (tools/*.py)
 __pycache__/
 *.pyc
+.venv*/
+
+# gw_terrain_import.py output (real imagery/DEM bakes -- per-user AOI, not repo
+# content), except the committed example tile itself.
+*_heightmap.png
+*_texture.png
+!/examples/terrain/*_heightmap.png
+!/examples/terrain/*_texture.png

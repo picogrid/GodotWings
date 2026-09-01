@@ -1,0 +1,19 @@
+{
+  "center_lat": 60.221088825593135,
+  "center_lon": 25.018208331290666,
+  "size_m": 4000.0,
+  "dem_resolution_m": 30.0,
+  "heightmap_px": 133,
+  "texture_px": 400,
+  "elevation_min_m": -0.878665030002594,
+  "elevation_max_m": 52.99711990356445,
+  "elevation_center_m": 5.031233310699463,
+  "source_sentinel2_id": "S2B_35VLG_20230519_0_L2A",
+  "source_sentinel2_datetime": "2023-05-19T09:44:00.361000Z",
+  "source_sentinel2_cloud_cover_pct": 0.001569,
+  "source_dem_tiles": [
+    "Copernicus_DSM_COG_10_N60_00_E024_00_DEM",
+    "Copernicus_DSM_COG_10_N60_00_E025_00_DEM"
+  ],
+  "projection": "AEQD centered at (60.221088825593135, 25.018208331290666)"
+}

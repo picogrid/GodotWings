@@ -278,6 +278,56 @@ lat/lon/pan/tilt update in real time as you drive the camera over its JSON
 control socket, and hard confirmation the metadata survived the mux intact
 (a corrupted or misframed packet simply fails its checksum and gets skipped).
 
+## Real-world terrain import
+
+`tools/gw_terrain_import.py` bakes a real place — real satellite imagery +
+real elevation — into a terrain tile `GWImportedTerrain` can load, from
+entirely open, no-registration data: Sentinel-2 L2A true-color imagery and
+Copernicus DEM GLO-30 elevation, both pulled from public AWS Open Data buckets
+via Element84's STAC API. It's an offline bake step — Godot never touches the
+network for this; the tool downloads/reprojects once, up front.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install rasterio numpy pillow requests
+python3 tools/gw_terrain_import.py --lat 60.221088825593135 --lon 25.018208331290666 \
+    --size-km 4 --out terrain_helsinki
+```
+
+It searches for the least-cloudy Sentinel-2 scene over the AOI, mosaics
+whichever Copernicus DEM tiles cover it (handles an AOI straddling a tile
+boundary), and reprojects both onto a local grid in an azimuthal-equidistant
+(AEQD) projection centered exactly on `--lat`/`--lon` — the geospatially
+rigorous version of the same flat-tangent-plane approximation
+`GWCoordConvert`/`GWGeoReference` already use elsewhere in this project.
+Writes `<out>_heightmap.png`, `<out>_texture.png`, and `<out>.json` (elevation
+range, source scene IDs/dates — for provenance — and everything
+`GWImportedTerrain` needs), then prints a `HOME_LOCATION` line for you to
+paste into `docker-compose.yml`/`.env`.
+
+Drop a `GWImportedTerrain` node (`addons/godotwings/world/ImportedTerrain.gd`)
+and point `heightmap_path` / `texture_path` / `metadata_path` at those three
+files — it builds a heightmapped, textured, collision-enabled mesh at
+`_ready()` (same procedural-build pattern as `examples/Terrain.gd`, just
+driven by real data instead of noise). Leave the node's own transform at
+identity: the tile is centered on its own origin, and since a `GWVehicleBody`
+spawns at NED (0,0) by default, **the AOI's center IS the takeoff point** with
+no extra glue — just make sure `HOME_LOCATION` (or `GWGeoReference.home_lat`/
+`home_lon`) actually matches `--lat`/`--lon`, so ArduPilot's own GPS origin
+agrees with the terrain under it.
+
+One thing worth knowing: Godot's `Image` has no true 16-bit-per-channel
+format — loading a 16-bit grayscale PNG silently truncates to 256 levels
+(verified directly, not assumed). So the heightmap packs each 16-bit sample
+across the R (high byte) and G (low byte) channels of an ordinary RGB8 PNG
+instead, which Godot *does* load at exact, full 8-bit-per-channel precision —
+`GWImportedTerrain._decode_height16()` unpacks it back losslessly.
+
+`examples/ImportedTerrain.tscn` is a ready-to-run example — a real baked tile
+over Helsinki (`examples/terrain/`, matching this project's own default
+`HOME_LOCATION`) with a manually-flyable `GWAircraft` (`terrain_following =
+true`) that spawns resting right on the real surface.
+
 ## Wind, collision & crash
 
 `GWWind` — drop one in the world and every vehicle auto-finds it. Mean wind
@@ -324,4 +374,7 @@ vehicle). With `NUM_VEHICLES > 1` the instances run headless.
 MIT. The stylized sky in `examples/World.tscn` uses GDQuest's
 [godot-4-stylized-sky](https://github.com/gdquest-demos/godot-4-stylized-sky)
 shader (MIT procedural resources only — no CC-BY-NC-SA art); see
-[examples/sky/CREDITS.md](examples/sky/CREDITS.md).
+[examples/sky/CREDITS.md](examples/sky/CREDITS.md). Terrain baked by
+`tools/gw_terrain_import.py` contains modified Copernicus Sentinel data and
+Copernicus DEM data (ESA/EU, free and open under the Copernicus data policy);
+attribute accordingly if you redistribute a baked tile.

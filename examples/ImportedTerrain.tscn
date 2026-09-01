@@ -1,0 +1,28 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://addons/godotwings/Aircraft.gd" id="1_air"]
+[ext_resource type="Script" path="res://addons/godotwings/camera/ViewCamera.gd" id="2_cam"]
+[ext_resource type="Script" path="res://addons/godotwings/world/ImportedTerrain.gd" id="3_terrain"]
+
+[node name="ImportedTerrainExample" type="Node3D"]
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.7, -0.5, 0.5, 0, 0.7, 0.7, -0.7, -0.5, 0.5, 0, 200, 0)
+shadow_enabled = true
+
+[node name="Terrain" type="MeshInstance3D" parent="."]
+script = ExtResource("3_terrain")
+heightmap_path = "res://examples/terrain/helsinki_heightmap.png"
+texture_path = "res://examples/terrain/helsinki_texture.png"
+metadata_path = "res://examples/terrain/helsinki.json"
+
+[node name="Aircraft" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 20, 0)
+script = ExtResource("1_air")
+model_yaw_offset_deg = 180.0
+control_source = 1
+terrain_following = true
+
+[node name="ViewCamera" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 30, 60)
+script = ExtResource("2_cam")
