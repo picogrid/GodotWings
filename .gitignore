@@ -28,3 +28,10 @@ __pycache__/
 *_texture.png
 !/examples/terrain/*_heightmap.png
 !/examples/terrain/*_texture.png
+
+# gw_3dtiles_prefetch.py output: a SESSION-SCOPED cache of real Cesium ion /
+# Google Photorealistic 3D Tiles content. Never committed and no example is
+# checked in either, unlike the terrain imagery above -- ion/Google's terms
+# restrict caching this content to the current session's use, not a
+# permanent offline mirror, so it must never land in git history at all.
+/.cache/3dtiles/

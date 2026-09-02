@@ -328,6 +328,105 @@ over Helsinki (`examples/terrain/`, matching this project's own default
 `HOME_LOCATION`) with a manually-flyable `GWAircraft` (`terrain_following =
 true`) that spawns resting right on the real surface.
 
+## Real Cesium 3D Tiles (buildings/terrain meshes)
+
+Real Cesium 3D Tiles content — e.g.
+[Google Photorealistic 3D Tiles](https://cesium.com/platform/cesium-ion/content/google-3d-tiles/)
+via Cesium ion — for real building/terrain meshes instead of a flat baked
+texture. This is a **separate system from `gw_terrain_import.py` above** —
+different data (real 3D meshes vs. a heightmapped imagery bake), different
+license/caching rules, don't conflate the two.
+
+**Requires a [Cesium ion](https://cesium.com/) account + access token**
+(free tier has a usage quota) — nothing here can provision one for you. Set
+it as an environment variable, never a file: `export CESIUM_ION_TOKEN=...`.
+It must never be committed or hardcoded.
+
+### Live streaming (`GWTiles3DStreamer`) — the real path
+
+`GWTiles3DStreamer` (`addons/godotwings/world/Tiles3DStreamer.gd`) fetches
+real tile content around the vehicle's current position **every session**
+and holds it in memory only — nothing is ever written to disk. This is the
+only path here that actually satisfies Cesium ion's and Google's terms: an
+earlier bounded-prefetch design (download once, cache to disk, fly with zero
+network access — see below) turned out to violate them outright, pulled
+live from the actual current terms, not assumed:
+
+- Cesium ion ToS §2.2.2 (`cesium.com/legal/terms-of-service/`): "You may not
+  copy, store, or redistribute any portion of Cesium Data Output in, or for
+  use in, **an offline environment**." The only caching exception is generic
+  client/proxy caching "that caches other internet traffic too" — ordinary
+  HTTP caching during *live* use, not a deliberate prefetch-then-run-offline
+  design.
+- Google Maps Content terms (`cesium.com/legal/terms-for-google/`): "You
+  will not... download Google Maps tiles **or Street View tiles for storage
+  or rehosting**."
+
+Drop a `GWTiles3DStreamer` node anywhere in the scene (it auto-finds the
+first `GWVehicleBody`, same pattern as `GWFloatingOrigin`) and set
+`home_lat`/`home_lon`/`home_alt` to match the vehicle's actual home position
+(e.g. `HOME_LOCATION`), plus `asset_id` (`2275207` = Google Photorealistic 3D
+Tiles). It resolves the ion asset, then streams tiles within
+`streaming_radius_km` of the vehicle's *live* position on two independent
+cadences:
+
+- every `poll_interval_s` (default 5s) it re-evaluates what should be loaded
+  around wherever the vehicle currently is, adding whatever's newly in range
+  and evicting whatever fell out — tiles stream in/out progressively as you
+  fly, not as one big chunk;
+- separately, once the vehicle drifts past `reanchor_distance_m`, the
+  *render frame's* anchor shifts and every already-loaded tile repositions
+  instantly from its stored real-world transform (no re-fetch) — this only
+  bounds the flat-tangent approximation error, it doesn't drive streaming.
+
+A background thread does all the fetching; results cross back to the main
+thread via a queue it drains every frame (mirrors `GWSITLBridge`'s pattern
+exactly) so none of this ever blocks the physics loop.
+
+**Keep `streaming_radius_km` small (a couple km)** — coverage over a large
+operating area comes from flying and reanchoring repeatedly, not from
+setting one big radius upfront. Every fetch in a pass is sequential on the
+one background thread, so a large radius means a large multiple of tiles to
+walk before the first one ever appears: 10km never finished a single pass in
+90 seconds against the real Google asset, while 1km finished in ~4s.
+
+**Attribution is required, not optional**: `GWTiles3DStreamer.attributions`
+is populated once the asset resolves — Cesium ion's and the content
+provider's terms require displaying these wherever the content is shown to
+anyone besides you. Render them in your own UI.
+
+### Offline bounded prefetch (`tools/gw_3dtiles_prefetch.py` + `GWTiles3DLoader`) — local debugging fixture ONLY
+
+Kept in the repo as a convenience for debugging the traversal/transform math
+against a small area **without a real ion token** (point `--tileset-url` at
+a public, unauthenticated sample, e.g.
+[Cesium's own sample tilesets](https://github.com/CesiumGS/3d-tiles-samples))
+— **not a compliant way to use real Cesium ion / Google data**, per the ToS
+excerpts above; that's exactly why `GWTiles3DStreamer` exists. Do not point
+this at a real ion token for anything beyond a momentary local check.
+
+```bash
+pip install requests numpy
+python3 tools/gw_3dtiles_prefetch.py \
+    --tileset-url https://raw.githubusercontent.com/CesiumGS/3d-tiles-samples/main/1.0/TilesetWithDiscreteLOD/tileset.json \
+    --lat 40.04253061142592 --lon -75.61209430782448 --radius-km 1 --detail-m 1
+```
+
+Output always lands under `.cache/3dtiles/` (gitignored — never commit tile
+content or a manifest); `--purge-stale-hours 24` deletes cache directories
+older than that; `GWTiles3DLoader.max_cache_age_hours` (default 24h) refuses
+to load a stale manifest at runtime; attribution is captured into the
+manifest's `content_attributions` and exposed as `GWTiles3DLoader.attributions`
+the same way. All of that reduces how far this can drift from "momentary
+local debugging" — it does not make the prefetch-and-store architecture
+itself compliant for real use.
+
+Drop a `GWTiles3DLoader` node and point `manifest_path` at the
+`manifest.json` the tool wrote — same "generate from an offline tool's
+output, no network at runtime" pattern as `GWImportedTerrain`, and likewise
+centered so the AOI's center sits at the node's own origin, composing with
+the rest of the scene the same way.
+
 ## Wind, collision & crash
 
 `GWWind` — drop one in the world and every vehicle auto-finds it. Mean wind

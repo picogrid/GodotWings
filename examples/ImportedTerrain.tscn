@@ -1,28 +1,32 @@
-[gd_scene format=3]
+[gd_scene format=3 uid="uid://ccoxdtmfcry53"]
 
-[ext_resource type="Script" path="res://addons/godotwings/Aircraft.gd" id="1_air"]
-[ext_resource type="Script" path="res://addons/godotwings/camera/ViewCamera.gd" id="2_cam"]
-[ext_resource type="Script" path="res://addons/godotwings/world/ImportedTerrain.gd" id="3_terrain"]
+[ext_resource type="Script" uid="uid://btq25u4xs5gcj" path="res://addons/godotwings/Aircraft.gd" id="1_air"]
+[ext_resource type="Script" uid="uid://25ml8ie24oyc" path="res://addons/godotwings/camera/ViewCamera.gd" id="2_cam"]
+[ext_resource type="Script" uid="uid://b3nwft5t5ia7t" path="res://addons/godotwings/world/Tiles3DStreamer.gd" id="3_pwlfi"]
 
-[node name="ImportedTerrainExample" type="Node3D"]
+[node name="ImportedTerrainExample" type="Node3D" unique_id=235115267]
 
-[node name="Sun" type="DirectionalLight3D" parent="."]
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=2110312534]
 transform = Transform3D(0.7, -0.5, 0.5, 0, 0.7, 0.7, -0.7, -0.5, 0.5, 0, 200, 0)
 shadow_enabled = true
 
-[node name="Terrain" type="MeshInstance3D" parent="."]
-script = ExtResource("3_terrain")
-heightmap_path = "res://examples/terrain/helsinki_heightmap.png"
-texture_path = "res://examples/terrain/helsinki_texture.png"
-metadata_path = "res://examples/terrain/helsinki.json"
-
-[node name="Aircraft" type="Node3D" parent="."]
+[node name="Aircraft" type="Node3D" parent="." unique_id=1853967014]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 20, 0)
 script = ExtResource("1_air")
 model_yaw_offset_deg = 180.0
 control_source = 1
 terrain_following = true
 
-[node name="ViewCamera" type="Camera3D" parent="."]
+[node name="ViewCamera" type="Camera3D" parent="." unique_id=254273971]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 30, 60)
 script = ExtResource("2_cam")
+
+[node name="GWTiles3DStreamer" type="Node3D" parent="." unique_id=2115240062]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -48.262543, 0)
+script = ExtResource("3_pwlfi")
+home_lat = 60.221
+home_lon = 25.018
+vehicle_path = NodePath("../Aircraft")
+streaming_radius_km = 1.0
+reanchor_distance_m = 200.0
+metadata/_custom_type_script = "uid://b3nwft5t5ia7t"
