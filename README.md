@@ -390,6 +390,16 @@ one background thread, so a large radius means a large multiple of tiles to
 walk before the first one ever appears: 10km never finished a single pass in
 90 seconds against the real Google asset, while 1km finished in ~4s.
 
+**Simple two-level LOD**: a second, wider/coarser ring loads alongside the
+near one above, controlled by `far_radius_km`/`far_detail_m` (defaults 5km /
+100m, vs. `streaming_radius_km`/`detail_m`'s 2km / 30m). Every poll walks the
+tileset twice — once at the near radius/detail, once at the far one — and the
+far pass skips any tile within `streaming_radius_km` of the vehicle, since
+the near pass already covers that area at better detail. The result is a
+wide low-detail area with a smaller high-detail area overlaid on top of it,
+without the two overlapping or z-fighting. Set `far_radius_km <=
+streaming_radius_km` to disable the far ring entirely (it becomes a no-op).
+
 **Attribution is required, not optional**: `GWTiles3DStreamer.attributions`
 is populated once the asset resolves — Cesium ion's and the content
 provider's terms require displaying these wherever the content is shown to

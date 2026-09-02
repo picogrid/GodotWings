@@ -4,6 +4,15 @@
 [ext_resource type="Script" uid="uid://25ml8ie24oyc" path="res://addons/godotwings/camera/ViewCamera.gd" id="2_cam"]
 [ext_resource type="Script" uid="uid://b3nwft5t5ia7t" path="res://addons/godotwings/world/Tiles3DStreamer.gd" id="3_pwlfi"]
 
+[sub_resource type="PhysicalSkyMaterial" id="PhysicalSkyMaterial_pwlfi"]
+
+[sub_resource type="Sky" id="Sky_12vny"]
+sky_material = SubResource("PhysicalSkyMaterial_pwlfi")
+
+[sub_resource type="Environment" id="Environment_pe3y5"]
+background_mode = 2
+sky = SubResource("Sky_12vny")
+
 [node name="ImportedTerrainExample" type="Node3D" unique_id=235115267]
 
 [node name="Sun" type="DirectionalLight3D" parent="." unique_id=2110312534]
@@ -21,6 +30,9 @@ terrain_following = true
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 30, 60)
 script = ExtResource("2_cam")
 
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1896737296]
+environment = SubResource("Environment_pe3y5")
+
 [node name="GWTiles3DStreamer" type="Node3D" parent="." unique_id=2115240062]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -48.262543, 0)
 script = ExtResource("3_pwlfi")
@@ -28,5 +40,6 @@ home_lat = 60.221
 home_lon = 25.018
 vehicle_path = NodePath("../Aircraft")
 streaming_radius_km = 1.0
+detail_m = 100.0
 reanchor_distance_m = 200.0
 metadata/_custom_type_script = "uid://b3nwft5t5ia7t"

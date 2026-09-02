@@ -112,6 +112,15 @@ func _get_property_list() -> Array:
 ## from raising this.
 @export var streaming_radius_km: float = 2.0
 @export var detail_m: float = 30.0
+## Simple two-level LOD: an optional wider, coarser ring loaded alongside
+## the near ring above. Low-detail content streams in over a LARGER area,
+## and the near ring's higher-detail content overlays it within its own
+## smaller radius -- tiles inside streaming_radius_km are skipped for this
+## far ring entirely (the near ring already covers them at better detail),
+## so the two rings never overlap/z-fight. Set far_radius_km <=
+## streaming_radius_km to disable this (the far ring becomes a no-op).
+@export var far_radius_km: float = 5.0
+@export var far_detail_m: float = 100.0
 ## Re-anchor the RENDER FRAME once the vehicle drifts this far from the
 ## current anchor (reposition already-loaded tiles from their stored ECEF
 ## transform, no re-fetch). Kept small (a few km) on purpose -- it bounds
@@ -165,6 +174,8 @@ var _target_lat := 0.0
 var _target_lon := 0.0
 var _target_alt := 0.0
 var _target_radius_km := 0.0
+var _target_far_radius_km := 0.0
+var _target_far_detail_m := 0.0
 var _target_generation := 0
 var _known_ids := PackedStringArray()
 var _pending_results: Array = []  ## [{"new_tiles": [...], "evict_ids": PackedStringArray, "generation": int}]
@@ -278,6 +289,8 @@ func _poll(lat: float, lon: float, alt: float) -> void:
 	_target_lon = lon
 	_target_alt = alt
 	_target_radius_km = streaming_radius_km
+	_target_far_radius_km = far_radius_km
+	_target_far_detail_m = far_detail_m
 	_target_generation = _current_generation
 	_known_ids = PackedStringArray(_loaded_tiles.keys())
 	_mutex.unlock()
@@ -347,8 +360,8 @@ func _drain_results() -> void:
 		if info.has("stats"):
 			var s: Dictionary = info["stats"]
 			var aoi: Dictionary = info["aoi"]
-			print("GWTiles3DStreamer: pass at (%.6f, %.6f) r=%.2fkm -- visited=%d pruned=%d downloaded=%d http_errors=%d" %
-					[aoi["lat"], aoi["lon"], aoi["radius_km"], s["visited"], s["pruned"], s["downloaded"], s["http_errors"]])
+			print("GWTiles3DStreamer: pass at (%.6f, %.6f) r=%.2fkm far_r=%.2fkm -- visited=%d pruned=%d excluded=%d downloaded=%d http_errors=%d" %
+					[aoi["lat"], aoi["lon"], aoi["radius_km"], aoi.get("far_radius_km", 0.0), s["visited"], s["pruned"], s.get("excluded", 0), s["downloaded"], s["http_errors"]])
 			if s["visited"] == 1 and s["pruned"] == 1:
 				push_warning("GWTiles3DStreamer: the tileset root itself was pruned -- home_lat/home_lon likely doesn't overlap " +
 						"real content for this asset (e.g. open ocean), or streaming_radius_km is too small.")
@@ -450,20 +463,36 @@ func _stream_loop() -> void:
 		var lon := _target_lon
 		var alt := _target_alt
 		var radius_km := _target_radius_km
+		var far_radius_km_snapshot := _target_far_radius_km
+		var far_detail_m_snapshot := _target_far_detail_m
 		var generation := _target_generation
 		var known_ids := PackedStringArray(_known_ids)
 		_mutex.unlock()
 		if not running:
 			break
 
-		var aoi_bbox: Array = GWTiles3DTraversal.bbox_from_center(lat, lon, radius_km)
 		var aoi_center: Vector3 = GWGeodeticConvert.geodetic_to_ecef(lat, lon, alt)
 		var found_ids := {}
 		var new_tiles := []
-		var visited := {}
-		var stats := {"visited": 0, "pruned": 0, "downloaded": 0, "http_errors": 0}
+		var stats := {"visited": 0, "pruned": 0, "downloaded": 0, "http_errors": 0, "excluded": 0}
+
+		# Near ring: full detail, no exclusion -- unchanged behavior.
+		var aoi_bbox: Array = GWTiles3DTraversal.bbox_from_center(lat, lon, radius_km)
+		var visited_near := {}
 		_walk_tileset(_tileset_root_url, Transform3D.IDENTITY, aoi_bbox, aoi_center, radius_km * 1000.0,
-				lat, lon, alt, known_ids, found_ids, new_tiles, visited, stats)
+				lat, lon, alt, detail_m, 0.0, known_ids, found_ids, new_tiles, visited_near, stats)
+
+		# Far ring: simple two-level LOD -- a wider, coarser pass that skips
+		# whatever the near ring above already covers at better detail (see
+		# far_radius_km's doc comment). A fresh `visited` set is needed since
+		# this walks the SAME tileset tree again at a different detail_m
+		# threshold, so tiles the near pass pruned as "too coarse to bother"
+		# may legitimately have "content" here instead.
+		if far_radius_km_snapshot > radius_km:
+			var aoi_bbox_far: Array = GWTiles3DTraversal.bbox_from_center(lat, lon, far_radius_km_snapshot)
+			var visited_far := {}
+			_walk_tileset(_tileset_root_url, Transform3D.IDENTITY, aoi_bbox_far, aoi_center, far_radius_km_snapshot * 1000.0,
+					lat, lon, alt, far_detail_m_snapshot, radius_km * 1000.0, known_ids, found_ids, new_tiles, visited_far, stats)
 
 		var evict_ids := PackedStringArray()
 		for id in known_ids:
@@ -473,7 +502,7 @@ func _stream_loop() -> void:
 		# Always report a summary, even an all-zero one -- a silent pass looks
 		# identical to a hung/broken one otherwise, which cost real
 		# troubleshooting time before this existed.
-		_post_info({"stats": stats, "aoi": {"lat": lat, "lon": lon, "radius_km": radius_km}})
+		_post_info({"stats": stats, "aoi": {"lat": lat, "lon": lon, "radius_km": radius_km, "far_radius_km": far_radius_km_snapshot}})
 
 		if new_tiles.size() > 0 or evict_ids.size() > 0:
 			_mutex.lock()
@@ -582,6 +611,7 @@ func _find_session_token(tile: Dictionary) -> String:
 
 func _walk_tileset(tileset_url: String, base_transform: Transform3D, aoi_bbox: Array, aoi_center: Vector3,
 		aoi_radius: float, anchor_lat: float, anchor_lon: float, anchor_alt: float,
+		detail_m_threshold: float, exclude_radius_m: float,
 		known_ids: PackedStringArray, found_ids: Dictionary, new_tiles: Array, visited: Dictionary, stats: Dictionary) -> void:
 	if visited.has(tileset_url):
 		return  # avoid infinite loops on a malformed/self-referential tileset
@@ -604,24 +634,25 @@ func _walk_tileset(tileset_url: String, base_transform: Transform3D, aoi_bbox: A
 	if session_token != "":
 		_auth_params = _ensure_param(_auth_params, "session=%s" % session_token)
 	_walk_tile(root, base_transform, tileset_url, aoi_bbox, aoi_center, aoi_radius,
-			anchor_lat, anchor_lon, anchor_alt, known_ids, found_ids, new_tiles, visited, stats)
+			anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
 
 
 func _walk_tile(tile: Dictionary, parent_transform: Transform3D, base_url: String, aoi_bbox: Array,
 		aoi_center: Vector3, aoi_radius: float, anchor_lat: float, anchor_lon: float, anchor_alt: float,
+		detail_m_threshold: float, exclude_radius_m: float,
 		known_ids: PackedStringArray, found_ids: Dictionary, new_tiles: Array, visited: Dictionary, stats: Dictionary) -> void:
 	stats["visited"] += 1
-	var result := GWTiles3DTraversal.evaluate_tile(tile, parent_transform, detail_m, aoi_bbox, aoi_center, aoi_radius)
+	var result := GWTiles3DTraversal.evaluate_tile(tile, parent_transform, detail_m_threshold, aoi_bbox, aoi_center, aoi_radius)
 	match result["action"]:
 		"content":
 			var bv: Dictionary = tile.get("boundingVolume", {})
 			for content in result["contents"]:
 				_handle_content(content, result["transform"], bv, base_url, aoi_bbox, aoi_center, aoi_radius,
-						anchor_lat, anchor_lon, anchor_alt, known_ids, found_ids, new_tiles, visited, stats)
+						anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
 		"recurse":
 			for entry in result["children"]:
 				_walk_tile(entry["tile"], entry["transform"], base_url, aoi_bbox, aoi_center, aoi_radius,
-						anchor_lat, anchor_lon, anchor_alt, known_ids, found_ids, new_tiles, visited, stats)
+						anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
 		"prune":
 			stats["pruned"] += 1
 		# "none": nothing to do
@@ -630,6 +661,7 @@ func _walk_tile(tile: Dictionary, parent_transform: Transform3D, base_url: Strin
 func _handle_content(content: Dictionary, transform: Transform3D, bv: Dictionary, base_url: String,
 		aoi_bbox: Array, aoi_center: Vector3, aoi_radius: float,
 		anchor_lat: float, anchor_lon: float, anchor_alt: float,
+		detail_m_threshold: float, exclude_radius_m: float,
 		known_ids: PackedStringArray, found_ids: Dictionary, new_tiles: Array, visited: Dictionary, stats: Dictionary) -> void:
 	var uri: String = content.get("uri", content.get("url", ""))
 	if uri == "":
@@ -642,7 +674,16 @@ func _handle_content(content: Dictionary, transform: Transform3D, bv: Dictionary
 		# accumulated so far as its new base. Same AOI (it's anchor-derived,
 		# not tileset-derived).
 		_walk_tileset(content_url, transform, aoi_bbox, aoi_center, aoi_radius,
-				anchor_lat, anchor_lon, anchor_alt, known_ids, found_ids, new_tiles, visited, stats)
+				anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
+		return
+
+	var approx_ecef_for_exclusion := _approx_tile_center_ecef(bv, transform)
+	if exclude_radius_m > 0.0 and (approx_ecef_for_exclusion - aoi_center).length() < exclude_radius_m:
+		# The far/coarse ring's tile falls within the near ring's radius,
+		# which already covers it at better detail -- skip it here so the
+		# two rings never place overlapping/z-fighting content for the same
+		# real-world area.
+		stats["excluded"] += 1
 		return
 
 	# A stable spatial hash of the tile's real-world position, NOT the
@@ -653,8 +694,9 @@ func _handle_content(content: Dictionary, transform: Transform3D, bv: Dictionary
 	# kept re-adding duplicates of tiles it already had (three identical
 	# stationary polls produced 3x the tile count instead of the same one).
 	# The bounding-volume-derived position is real, stable geographic data
-	# and costs nothing extra to compute (already needed for approx_position).
-	var approx_ecef := _approx_tile_center_ecef(bv, transform)
+	# and costs nothing extra to compute (already needed for approx_position;
+	# reused from the exclusion check above rather than recomputed).
+	var approx_ecef := approx_ecef_for_exclusion
 	var stable_id := _stable_tile_id(approx_ecef)
 
 	if found_ids.has(stable_id):
