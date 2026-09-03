@@ -145,6 +145,27 @@ func _get_property_list() -> Array:
 ## Instantiate at most this many newly-arrived tiles per frame, so a burst
 ## of arrivals (e.g. right after a reanchor) doesn't stutter a frame.
 @export var tiles_per_frame_budget: int = 4
+## Keep a loaded tile until it is this many times streaming_radius_km from the
+## vehicle's CURRENT position, rather than dropping it the moment a pass's area
+## of interest no longer covers it.
+##
+## Without a margin, every applied pass prunes back to a circle around wherever
+## the vehicle was when that pass STARTED -- tens of seconds ago. Flying a
+## circle, that wipes most of what is loaded each time and reloads it moments
+## later: measured on a 2.5km circle, 174 tiles down to 47, then 137 down to
+## 34. The ground visibly blinks out and refills. 1.0 reproduces that; the
+## default keeps anything still plausibly in view.
+@export var evict_margin: float = 2.5
+## Centre the area of interest this many seconds AHEAD of the vehicle along its
+## own velocity, instead of on where it is right now.
+##
+## A pass takes tens of seconds against a real asset and places nothing until
+## it finishes, so an area of interest centred on the current position always
+## delivers content for where the vehicle already was -- at 30 m/s, a 20s pass
+## lands 600m behind. Leading the area by roughly one pass duration means the
+## tiles arrive about where the vehicle will be when they do. 0 restores
+## centring on the current position.
+@export var lookahead_s: float = 20.0
 
 ## Attribution HTML snippets from the ion endpoint response, populated once
 ## the background thread resolves the asset. Cesium ion's and the content
@@ -193,7 +214,7 @@ var _pending_info: Array = []     ## [{"error": String} | {"attributions": Array
 ## from a stale pass are still real content, just placed at a position
 ## recomputed fresh against the CURRENT anchor rather than trusting the
 ## stale one baked in at fetch time.
-var _current_generation := 0
+var _anchor_generation := 0
 
 
 func _ready() -> void:
@@ -251,6 +272,16 @@ func _process(delta: float) -> void:
 		return
 
 	var pos_ned: Vector3 = _vehicle._pos_ned  # established convention: GWCamera/GWGeoReference already reach into this
+	# Stream for where the vehicle is heading, not where it is. The lead is
+	# capped at the streaming radius: beyond that the area of interest would no
+	# longer cover the vehicle itself, which is the one place ground is
+	# definitely needed.
+	if lookahead_s > 0.0:
+		var lead: Vector3 = _vehicle._vel_ned * lookahead_s
+		var max_lead := streaming_radius_km * 1000.0
+		if lead.length() > max_lead:
+			lead = lead.normalized() * max_lead
+		pos_ned += lead
 	var geo: Array = GWGeodeticConvert.ned_to_geodetic(pos_ned, home_lat, home_lon, home_alt)
 	var lat: float = geo[0]
 	var lon: float = geo[1]
@@ -283,7 +314,6 @@ func _process(delta: float) -> void:
 ## fresh anchor gets evaluated right away rather than waiting out the next
 ## poll interval.
 func _poll(lat: float, lon: float, alt: float) -> void:
-	_current_generation += 1
 	_mutex.lock()
 	_target_lat = lat
 	_target_lon = lon
@@ -291,7 +321,7 @@ func _poll(lat: float, lon: float, alt: float) -> void:
 	_target_radius_km = streaming_radius_km
 	_target_far_radius_km = far_radius_km
 	_target_far_detail_m = far_detail_m
-	_target_generation = _current_generation
+	_target_generation = _anchor_generation
 	_known_ids = PackedStringArray(_loaded_tiles.keys())
 	_mutex.unlock()
 	_wake_sem.post()
@@ -321,6 +351,17 @@ func _poll(lat: float, lon: float, alt: float) -> void:
 ## how many times this has reanchored, and is exactly what makes this node
 ## behave correctly as a GWFloatingOrigin shift_node too, if one is present.
 func _reanchor(lat: float, lon: float, alt: float) -> void:
+	# Bumped here and ONLY here: the eviction guard in _drain_results uses this
+	# to spot a pass whose AOI was computed against a superseded anchor. It used
+	# to be bumped in _poll() instead, which runs every poll_interval_s -- so
+	# for any pass slower than one poll (they take tens of seconds against a
+	# real asset, polls default to 5s) the guard never matched and evictions
+	# were silently dropped every time. Tiles then accumulated until
+	# max_tiles_loaded, after which newly fetched tiles could not be placed at
+	# all: flying on, the ground ahead stayed empty while stale tiles behind
+	# were kept forever. Measured on a 2.5km circle: 46 tiles rising
+	# monotonically to exactly 300, with zero evictions applied.
+	_anchor_generation += 1
 	_has_anchor = true
 	_anchor_lat = lat
 	_anchor_lon = lon
@@ -383,9 +424,26 @@ func _drain_results() -> void:
 		# real content either way -- just placed at a position recomputed
 		# fresh against the CURRENT anchor (see _place_new_tile) rather than
 		# trusting whatever anchor was active when they were fetched.
-		if int(batch["generation"]) == _current_generation:
+		if int(batch["generation"]) == _anchor_generation:
+			# The pass proposes what its own area of interest no longer covers;
+			# whether a tile actually goes is decided here against the
+			# vehicle's live position, which has moved on since.
+			var keep_radius := streaming_radius_km * 1000.0 * maxf(evict_margin, 1.0)
+			var vehicle_pos := GWCoordConvert.ned_to_world(_vehicle._pos_ned) if _vehicle != null else Vector3.ZERO
 			for id in batch["evict_ids"]:
-				_evict_tile(id)
+				if not _loaded_tiles.has(id):
+					continue
+				# Deliberately NOT the wrapper's own position: for Google tiles
+				# that is ~Earth-center-relative and identical for every tile
+				# in a pass (see approx_position's doc comment), so using it
+				# put every tile ~18000m away and evicted the lot.
+				var e: Vector3 = _loaded_tiles[id].get("approx_ecef", Vector3.ZERO)
+				if e == Vector3.ZERO:
+					continue  # unknown position: keep it rather than guess
+				var tile_pos: Vector3 = position + GWGeodeticConvert.ecef_xyz_to_godot_position(
+						e.x, e.y, e.z, _anchor_lat, _anchor_lon, _anchor_alt)
+				if tile_pos.distance_to(vehicle_pos) > keep_radius:
+					_evict_tile(id)
 		for tile in batch["new_tiles"]:
 			if not _loaded_tiles.has(tile["id"]):
 				_incoming_tiles.append(tile)
@@ -420,7 +478,11 @@ func _place_new_tile(tile: Dictionary) -> void:
 	if wrapper == null:
 		push_warning("GWTiles3DStreamer: failed to parse/place tile %s" % tile["id"])
 		return
-	_loaded_tiles[tile["id"]] = {"wrapper": wrapper, "ecef_transform": tile["ecef_transform"]}
+	_loaded_tiles[tile["id"]] = {
+		"wrapper": wrapper,
+		"ecef_transform": tile["ecef_transform"],
+		"approx_ecef": tile.get("approx_ecef", Vector3.ZERO),
+	}
 
 
 func _evict_tile(id: String) -> void:
@@ -732,6 +794,11 @@ func _handle_content(content: Dictionary, transform: Transform3D, bv: Dictionary
 		# silent no-op (every tile tied on the same key).
 		"approx_position": GWGeodeticConvert.ecef_xyz_to_godot_position(
 				approx_ecef.x, approx_ecef.y, approx_ecef.z, anchor_lat, anchor_lon, anchor_alt),
+		# The same centre, anchor-independent: approx_position above is relative
+		# to whatever anchor was current at fetch time, so it goes stale on a
+		# reanchor. Keeping the raw ECEF lets a tile's real position be
+		# recomputed against the CURRENT anchor whenever it is needed.
+		"approx_ecef": approx_ecef,
 	})
 
 
