@@ -50,6 +50,11 @@ const NEUTRAL_DEADBAND := 0.02
 ## Set `spawn_altitude` from the wheel geometry (CG height at rest) so the vehicle
 ## spawns sitting on its wheels. Off = use `spawn_altitude` as set.
 @export var auto_spawn_height: bool = true
+## If ground appears ABOVE every wheel within this height (m) — a streamed tile
+## loading over a vehicle parked on the flat fallback, a finer tile replacing a
+## coarser one — lift the vehicle onto it. Large enough for terrain LOD steps,
+## small enough that a bridge deck overhead is left alone. 0 = never lift.
+@export var lift_onto_surface_m: float = 8.0
 
 ## The wheels. Left empty, they are built from `config` geometry at setup (4
 ## wheels: FL, FR, RL, RR). GWRover fills this from a visual model's wheel nodes
@@ -191,22 +196,49 @@ func _distribute_static_load() -> void:
 # --- Terrain sampling ---------------------------------------------------------
 
 ## One terrain probe per wheel (plus one under the CG for the base class's AGL /
-## rangefinder), once per frame; the sub-steps reuse the sampled planes.
+## rangefinder and spawn height), once per frame; the sub-steps reuse the
+## sampled planes. The CG probe reaches far up like the other vehicles' so a
+## spawn lands on terrain that is well above the flat fallback; the wheel
+## probes stay short so a bridge or canopy above is never taken for the ground.
+##
+## Buried vehicle: when a long probe finds a surface ABOVE every hub, within
+## `lift_onto_surface_m`, the ground has appeared over us — a streamed tile
+## arriving after a spawn on the flat fallback, or a coarse tile swapped for a
+## finer one metres higher. Lift the chassis onto it rather than leaving it
+## driving on the plane underneath, out of sight.
 func _update_ground_sample() -> void:
-	var cg := _probe_ground(_pos_ned)
+	var cg := _probe_ground(_pos_ned, GROUND_PROBE_UP)
 	_ground_down = cg[0]
 	_ground_normal = cg[1]
+	var buried := 0
+	var surface_down := INF   # highest surface found above a wheel (NED down, smaller = higher)
 	for w in wheels:
 		var hub := _pos_ned + _dcm * w.hub_rest
-		var p := _probe_ground(hub)
+		var p := _probe_ground(hub, probe_up)
 		w.ground_hit = p[2]
 		w.ground_point = Vector3(hub.x, hub.y, p[0])
 		w.ground_normal = p[1]
+		if terrain_following and lift_onto_surface_m > 0.0:
+			var long_probe := _probe_ground(hub, GROUND_PROBE_UP)
+			if long_probe[2] and long_probe[0] < hub.z and hub.z - long_probe[0] <= lift_onto_surface_m:
+				buried += 1
+				surface_down = minf(surface_down, long_probe[0])
+	if buried == wheels.size() and is_finite(surface_down) and not _crashed and not _ragdolling:
+		_pos_ned.z = surface_down - rest_cg_height()
+		_vel_ned.z = minf(_vel_ned.z, 0.0)
+		for w in wheels:
+			var hub := _pos_ned + _dcm * w.hub_rest
+			var p := _probe_ground(hub, probe_up)
+			w.ground_hit = p[2]
+			w.ground_point = Vector3(hub.x, hub.y, p[0])
+			w.ground_normal = p[1]
+			w._droop_valid = false
 
 
-## Downward ray under a NED point: [ground NED-down, normal NED, hit]. Flat plane
-## at `ground_level` when terrain following is off, out of tree, or on a miss.
-func _probe_ground(p_ned: Vector3) -> Array:
+## Downward ray under a NED point, starting `up` metres above it: [ground
+## NED-down, normal NED, hit]. Flat plane at `ground_level` when terrain
+## following is off, out of tree, or on a miss (hit = false then).
+func _probe_ground(p_ned: Vector3, up: float) -> Array:
 	if not terrain_following or not is_inside_tree():
 		return [-ground_level, Vector3(0, 0, -1), true]
 	var space := get_world_3d().direct_space_state
@@ -214,7 +246,7 @@ func _probe_ground(p_ned: Vector3) -> Array:
 		return [-ground_level, Vector3(0, 0, -1), true]
 	var r := GWCoordConvert.ned_to_world(p_ned) - render_origin
 	var params := PhysicsRayQueryParameters3D.create(
-			r + Vector3(0, probe_up, 0), r - Vector3(0, probe_down, 0), ground_collision_mask)
+			r + Vector3(0, up, 0), r - Vector3(0, probe_down, 0), ground_collision_mask)
 	var hit := space.intersect_ray(params)
 	if hit.is_empty():
 		return [-ground_level, Vector3(0, 0, -1), false]

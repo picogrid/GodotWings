@@ -17,6 +17,7 @@ func _initialize() -> void:
 	await _test_placeholder()
 	await _test_model_standard()
 	await _test_slope_hold()
+	await _test_buried_by_streamed_terrain()
 	print("test_rover_model: ", "PASS" if _ok else "FAIL")
 	quit(0 if _ok else 1)
 
@@ -212,4 +213,52 @@ func _test_slope_hold() -> void:
 	_check(r._pos_ned.x - start.x > 1.0 and r._pos_ned.z < start.z - 0.2,
 			"climbs the slope under power (dN=%.1f m, dUp=%.2f m)" % [r._pos_ned.x - start.x, start.z - r._pos_ned.z])
 	r.queue_free(); slope.queue_free()
+	await physics_frame
+
+
+# --- terrain streams in ABOVE a parked rover (tile arriving after spawn) -----------
+func _test_buried_by_streamed_terrain() -> void:
+	print("[buried by streamed terrain]")
+	var ground := _flat_ground()
+	get_root().add_child(ground)
+	await physics_frame
+	await physics_frame
+	var r := GWRover.new()
+	r.control_source = GWVehicleBody.ControlSource.MANUAL
+	r.terrain_following = true
+	r.ground_collision_mask = 1
+	r.crash_mode = GWVehicleBody.CrashMode.SIMPLE
+	get_root().add_child(r)
+	await physics_frame
+	(r.get_node("GWManualInput") as GWManualInput).enabled = false
+	var pwm := PackedInt32Array()
+	pwm.resize(16)
+	pwm.fill(1500)
+	r._update_controls(pwm)
+	for _i in 50:
+		r._step(0.02)
+	var before := -r._pos_ned.z
+	# A "tile" surface 6 m above the flat plane appears over the vehicle.
+	var tile := StaticBody3D.new()
+	tile.collision_layer = 1
+	var cs := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(40.0, 0.5, 40.0)
+	cs.shape = box
+	tile.add_child(cs)
+	tile.position = Vector3(0.0, 6.0, 0.0)
+	get_root().add_child(tile)
+	await physics_frame
+	await physics_frame
+	for _i in 100:
+		r._step(0.02)
+	var after := -r._pos_ned.z
+	_check(after > before + 5.0 and absf(after - (6.25 + r.spawn_altitude)) < 0.1,
+			"lifted onto the surface that appeared above it (%.2f -> %.2f m)" % [before, after])
+	var contacts := 0
+	for w in r.wheels:
+		if w.in_contact:
+			contacts += 1
+	_check(contacts == 4 and not r._crashed, "all wheels on the new surface, no crash")
+	r.queue_free(); tile.queue_free(); ground.queue_free()
 	await physics_frame
