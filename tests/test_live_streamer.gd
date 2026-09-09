@@ -13,6 +13,7 @@ class SyntheticStreamer extends GWTiles3DStreamer:
 	var request_counts: Dictionary = {}
 	var expected_sessions: Dictionary = {}
 	var request_urls: Array[String] = []
+	var reported_errors: Array[String] = []
 
 	func _ready() -> void:
 		_mutex = Mutex.new()
@@ -52,6 +53,12 @@ class SyntheticStreamer extends GWTiles3DStreamer:
 			"status": 200,
 			"body": JSON.stringify(response).to_utf8_buffer(),
 		}
+
+	func _post_info(info: Dictionary) -> void:
+		if info.has("error"):
+			reported_errors.append(String(info["error"]))
+			return
+		super._post_info(info)
 
 	func _place_new_tile(tile: Dictionary) -> void:
 		# GLB decoding has its own live check. Keep the real admission and
@@ -732,6 +739,117 @@ func _test_transformed_instances_have_stable_identity() -> void:
 			"a later selection reuses both transformed identities without duplicate payloads")
 
 
+func _test_sequential_external_instances_survive_cycle_guard() -> void:
+	var transform_a := GWTiles3DTraversal.parse_gltf_transform(
+			_translation_matrix(_anchor_ecef + Vector3(0.0, -50.0, 0.0)))
+	var transform_b := GWTiles3DTraversal.parse_gltf_transform(
+			_translation_matrix(_anchor_ecef + Vector3(0.0, 50.0, 0.0)))
+	var root_tile := _contentless_tile(_anchor_ecef, 100.0, [
+		{
+			"boundingVolume": _sphere(Vector3.ZERO),
+			"geometricError": 0.0,
+			"transform": _translation_matrix(transform_a.origin),
+			"content": {"uri": "shared-external.json"},
+		},
+		{
+			"boundingVolume": _sphere(Vector3.ZERO),
+			"geometricError": 0.0,
+			"transform": _translation_matrix(transform_b.origin),
+			"content": {"uri": "shared-external.json"},
+		},
+	])
+	var streamer := _new_streamer(_document(root_tile), 2, 2)
+	streamer.responses["https://synthetic.test/shared-external.json"] = _document(
+			_content_tile("external-instance.glb", Vector3.ZERO))
+	_serve_content(streamer, ["external-instance.glb"])
+	_run_and_drain(streamer, 1)
+
+	var id_a := GWTiles3DStreamer._stable_tile_id(
+			"https://synthetic.test/external-instance.glb", transform_a, 0)
+	var id_b := GWTiles3DStreamer._stable_tile_id(
+			"https://synthetic.test/external-instance.glb", transform_b, 0)
+	_check(id_a != id_b and streamer._loaded_tiles.has(id_a)
+			and streamer._loaded_tiles.has(id_b)
+			and streamer.request_counts.get(
+					"https://synthetic.test/shared-external.json", 0) == 1,
+			"sequential transformed instances of one external document remain distinct")
+
+
+func _test_transformed_external_document_cycle_is_rejected() -> void:
+	var cycle_a_url := "https://synthetic.test/cycle-a.json"
+	var cycle_b_url := "https://synthetic.test/cycle-b.json"
+	var cycle_a_root := {
+		"boundingVolume": _sphere(Vector3.ZERO),
+		"geometricError": 0.0,
+		"transform": _translation_matrix(Vector3(1.0, 0.0, 0.0)),
+		"content": {"uri": "cycle-b.json"},
+	}
+	var cycle_b_root := {
+		"boundingVolume": _sphere(Vector3.ZERO),
+		"geometricError": 0.0,
+		"transform": _translation_matrix(Vector3(0.0, 1.0, 0.0)),
+		"content": {"uri": "cycle-a.json"},
+	}
+	var streamer := _new_streamer(_document(
+			_content_tile("unused-cycle.glb", _anchor_ecef)))
+	streamer.responses[cycle_a_url] = _document(cycle_a_root)
+	streamer.responses[cycle_b_url] = _document(cycle_b_root)
+
+	var result := streamer._walk_tileset_live(
+			cycle_a_url, Transform3D.IDENTITY, _snapshot(streamer, 1),
+			{}, {}, "", 8, true, true, [])
+	_check(not result.get("ok", true)
+			and streamer.request_counts.get(cycle_a_url, 0) == 1
+			and streamer.request_counts.get(cycle_b_url, 0) == 1,
+			"external-document ancestry rejects a cycle despite cumulative transforms")
+
+
+func _test_metadata_failure_is_reported_once_without_credentials() -> void:
+	var safe_url := "https://synthetic.test/failed-metadata.json"
+	var credentialed_url := safe_url + "?access_token=SECRET&session=PRIVATE"
+	var streamer := _new_streamer(_document(
+			_content_tile("unused-failure.glb", _anchor_ecef)))
+	streamer.responses[safe_url] = {"__status": 503}
+
+	for unused in 2:
+		streamer._walk_tileset_live(
+				credentialed_url, Transform3D.IDENTITY, _snapshot(streamer, 1),
+				{}, {}, "", 1, true, true, [])
+	var diagnostic := ""
+	if streamer.reported_errors.size() == 1:
+		diagnostic = streamer.reported_errors[0]
+	_check(streamer.reported_errors.size() == 1
+			and "HTTP 503" in diagnostic
+			and "SECRET" not in diagnostic
+			and "PRIVATE" not in diagnostic
+			and safe_url not in diagnostic,
+			"metadata HTTP failures report actionable credential-safe diagnostics once")
+
+
+func _test_camera_offsets_are_snapshotted() -> void:
+	var streamer := _new_streamer(_document(
+			_content_tile("unused-camera.glb", _anchor_ecef)))
+	var camera := Camera3D.new()
+	streamer.add_child(camera)
+	camera.h_offset = 100.0
+	camera.v_offset = 50.0
+	camera.fov = 60.0
+	streamer.set_cameras([camera])
+
+	var bounds := {"center": Vector3(100.0, 50.0, -10.0), "radius": 0.5}
+	var views := streamer._camera_snapshots()
+	_check(not views.is_empty()
+			and GWTiles3DTraversal.bounds_visible(bounds, views[0]),
+			"terrain along the offset render camera's axis remains visible")
+	camera.h_offset = 0.0
+	camera.v_offset = 0.0
+	views = streamer._camera_snapshots()
+	_check(not views.is_empty()
+			and not GWTiles3DTraversal.bounds_visible(bounds, views[0]),
+			"the same terrain lies outside the unshifted camera frustum")
+	camera.queue_free()
+
+
 func _test_payload_scheduler_yields_only_to_real_target_changes() -> void:
 	var streamer := _new_streamer(_document(
 			_content_tile("scheduler-root.glb", _anchor_ecef)), 8, 8)
@@ -782,6 +900,10 @@ func _run() -> void:
 	_test_transformed_instances_have_stable_identity()
 	_test_nested_sessions_are_bound_to_requests()
 	_test_nested_403_preserves_parent_session()
+	_test_sequential_external_instances_survive_cycle_guard()
+	_test_transformed_external_document_cycle_is_rejected()
+	_test_metadata_failure_is_reported_once_without_credentials()
+	_test_camera_offsets_are_snapshotted()
 	_test_payload_scheduler_yields_only_to_real_target_changes()
 
 	print("\ntest_live_streamer: ", "PASS" if _ok else "FAIL")

@@ -179,6 +179,7 @@ var _tileset_root_url := ""
 var _is_google := false
 var _document_cache: Dictionary = {}
 var _selection_budget_exhausted := false
+var _next_metadata_failure_report_msec := 0
 
 
 ## Configure every render camera that must participate in selection. Weak
@@ -305,9 +306,10 @@ func _camera_snapshots() -> Array:
 		else:
 			tan_x = tan(deg_to_rad(camera.fov) * 0.5)
 			tan_y = tan_x / aspect
-		var basis := camera.global_transform.basis
+		var camera_transform := camera.get_camera_transform()
+		var basis := camera_transform.basis
 		views.append({
-			"position": to_local(camera.global_position),
+			"position": to_local(camera_transform.origin),
 			"forward": (inverse_basis * -basis.z).normalized(),
 			"right": (inverse_basis * basis.x).normalized(),
 			"up": (inverse_basis * basis.y).normalized(),
@@ -781,6 +783,19 @@ func _post_info(info: Dictionary) -> void:
 	_pending_info.append(info)
 	_mutex.unlock()
 
+
+func _report_metadata_failure(tileset_url: String, response: Dictionary) -> void:
+	var now := Time.get_ticks_msec()
+	if now < _next_metadata_failure_report_msec:
+		return
+	_next_metadata_failure_report_msec = now + 5000
+	var document_id := tileset_url.split("?", true, 1)[0].sha256_text().substr(0, 12)
+	var status := int(response.get("status", 0))
+	var reason := "HTTP %d" % status if status > 0 else String(
+			response.get("error", "transport error"))
+	_post_info({"error": "GWTiles3DStreamer: external tileset metadata request failed (%s, document %s); check network access and Cesium ion credentials/session."
+			% [reason, document_id]})
+
 ## Returns {"ok": bool, "tileset_url": String, "auth_query": String,
 ## "attributions": Array, "is_google": bool} -- same two response shapes
 ## verified live against a real ion account this session (see
@@ -933,11 +948,12 @@ func _download_selection(desired: Dictionary, snapshot: Dictionary, sent: Dictio
 func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapshot: Dictionary,
 		desired: Dictionary, active_documents: Dictionary, pending_parent: String, budget: int,
 		refine_enabled: bool, force_coverage: bool, transitions: Array) -> Dictionary:
+	# URI-only ancestry rejects transformed cycles; erasing on return still
+	# permits sequential sibling instances of the same external document.
 	var document_uri := _canonical_content_uri(tileset_url)
-	var instance_key := document_uri + "@" + _transform_key(base_transform)
-	if active_documents.has(instance_key):
+	if active_documents.has(document_uri):
 		return {"ok": false, "complete": false, "coverage": PackedStringArray()}
-	active_documents[instance_key] = true
+	active_documents[document_uri] = true
 	var is_root := document_uri == _canonical_content_uri(_tileset_root_url)
 	# Each document can mint its own session. Cache by the effective request,
 	# and restore the parent's context after descending into an external set.
@@ -949,11 +965,13 @@ func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapsh
 		if not resp["ok"]:
 			if int(resp.get("status", 0)) in [400, 401, 403]:
 				_document_cache.clear()
-			active_documents.erase(instance_key)
+			if _thread_running():
+				_report_metadata_failure(tileset_url, resp)
+			active_documents.erase(document_uri)
 			return {"ok": false, "complete": false, "coverage": PackedStringArray()}
 		doc = JSON.parse_string((resp["body"] as PackedByteArray).get_string_from_utf8())
 		if not (doc is Dictionary) or not doc.has("root"):
-			active_documents.erase(instance_key)
+			active_documents.erase(document_uri)
 			return {"ok": false, "complete": false, "coverage": PackedStringArray()}
 	var parent_auth := _auth_params
 	var token := _find_session_token(doc["root"])
@@ -967,7 +985,7 @@ func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapsh
 			active_documents, pending_parent, budget, "REPLACE", refine_enabled,
 			force_coverage, transitions)
 	_auth_params = parent_auth
-	active_documents.erase(instance_key)
+	active_documents.erase(document_uri)
 	return result
 
 
@@ -1145,10 +1163,6 @@ static func _stable_tile_id(content_uri: String, transform: Transform3D,
 	var identity := _canonical_content_uri(content_uri) + "|" \
 			+ var_to_bytes(transform).hex_encode() + "|" + str(content_index)
 	return "tile:" + identity.sha256_text()
-
-
-static func _transform_key(transform: Transform3D) -> String:
-	return var_to_bytes(transform).hex_encode()
 
 
 static func _canonical_content_uri(uri: String) -> String:

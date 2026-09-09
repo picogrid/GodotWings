@@ -395,6 +395,10 @@ camera targets interrupt the old payload queue after a small progress batch.
 the highest projected errors receive refinement first. The error setting is
 therefore a target, not a guarantee that every visible tile meets it.
 
+If every slot belongs to the retained detailed cut, new coarse payloads wait
+until a complete selection permits safe eviction. A failed detailed traversal
+therefore preserves that cut rather than exceeding the residency cap.
+
 Lower pixel-error targets can require substantially more data and take minutes
 to finish over a slow connection. Network/traversal work is off the main thread,
 but an individual GLB import still runs on it and can cause a frame-time spike.
