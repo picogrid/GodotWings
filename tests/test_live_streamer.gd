@@ -602,6 +602,49 @@ func _test_failed_payloads_preserve_nested_fallbacks() -> void:
 			"one failed replacement sibling preserves the visible parent fallback")
 
 
+func _test_failed_root_payload_promotes_complete_children() -> void:
+	var root_tile := _content_tile("missing-root.glb", _anchor_ecef, 100.0, [
+		_content_tile("root-leaf-a.glb", _anchor_ecef),
+		_content_tile("root-leaf-b.glb", _anchor_ecef),
+	])
+	var streamer := _new_streamer(_document(root_tile), 3, 1)
+	streamer.responses["https://synthetic.test/missing-root.glb"] = "not a glTF".to_utf8_buffer()
+	_serve_content(streamer, ["root-leaf-a.glb", "root-leaf-b.glb"])
+	streamer._run_selection(_snapshot(streamer, 1, [_view(Vector3.FORWARD)]))
+
+	var parent := _id("missing-root.glb")
+	var leaf_a := _id("root-leaf-a.glb")
+	var leaf_b := _id("root-leaf-b.glb")
+	streamer._drain_results()
+	_check(not streamer._loaded_tiles.has(parent)
+			and streamer._loaded_tiles.has(leaf_a) and not _is_visible(streamer, leaf_a)
+			and not streamer._loaded_tiles.has(leaf_b),
+			"a partial root replacement remains hidden when its unavailable coarse payload cannot cover")
+	streamer._drain_results()
+	_check(_is_visible(streamer, leaf_a) and _is_visible(streamer, leaf_b)
+			and streamer._has_active_coverage(parent),
+			"a complete root replacement becomes truthful visible coverage despite its unavailable coarse payload")
+
+	# Coarsening to the still-desired unavailable root retains its last usable
+	# cut instead of creating a hole.
+	_run_and_drain(streamer, 2)
+	_check(_is_visible(streamer, leaf_a) and _is_visible(streamer, leaf_b)
+			and streamer._has_active_coverage(parent),
+			"an unavailable desired root retains its rescued child coverage while coarsening")
+
+	# A later authoritative selection outside this root must release the rescue;
+	# the absent parent is not a permanent residency pin.
+	streamer._document_cache.clear()
+	streamer.responses[ROOT_URL] = _document(
+			_content_tile("replacement-root.glb", _anchor_ecef))
+	_serve_content(streamer, ["replacement-root.glb"])
+	_run_and_drain(streamer, 3)
+	_check(_is_visible(streamer, _id("replacement-root.glb"))
+			and not streamer._loaded_tiles.has(leaf_a)
+			and not streamer._loaded_tiles.has(leaf_b),
+			"an authoritative selection elsewhere retires rescued root children")
+
+
 func _test_nested_sessions_are_bound_to_requests() -> void:
 	var nested_a := {
 		"boundingVolume": _sphere(_anchor_ecef),
@@ -897,6 +940,7 @@ func _run() -> void:
 	_test_queue_pressure_and_budget_rollback()
 	_test_completed_older_snapshot_is_accepted()
 	_test_failed_payloads_preserve_nested_fallbacks()
+	_test_failed_root_payload_promotes_complete_children()
 	_test_transformed_instances_have_stable_identity()
 	_test_nested_sessions_are_bound_to_requests()
 	_test_nested_403_preserves_parent_session()

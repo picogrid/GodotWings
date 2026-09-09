@@ -495,7 +495,7 @@ func _accept_placed_tile(tile: Dictionary, wrapper: Node3D) -> void:
 
 func _register_transition(event: Dictionary) -> void:
 	var parent_ids := PackedStringArray(event.get("parent_ids", []))
-	if parent_ids.is_empty():
+	if parent_ids.is_empty() or not event.has("fallback_parent"):
 		return
 	var group_id := String(parent_ids[0])
 	var required_ids := PackedStringArray(event.get("required_ids", []))
@@ -504,16 +504,20 @@ func _register_transition(event: Dictionary) -> void:
 	for required_id in required_ids:
 		if String(required_id) in parent_ids:
 			return
+	var fallback_parent := String(event["fallback_parent"])
 	if _replacement_groups.has(group_id):
 		var existing: Dictionary = _replacement_groups[group_id]
 		# Parent/child relations come from immutable tileset metadata. Never
 		# reset a promoted cut merely because another view reports it again.
-		if existing["parent_ids"] == parent_ids and existing["required_ids"] == required_ids:
+		if existing["parent_ids"] == parent_ids \
+				and existing["required_ids"] == required_ids \
+				and String(existing["fallback_parent"]) == fallback_parent:
 			existing["selected_revision"] = _accepted_view_revision
-		return
+			return
 	_replacement_groups[group_id] = {
 		"parent_ids": parent_ids,
 		"required_ids": required_ids,
+		"fallback_parent": fallback_parent,
 		"promoted": false,
 		"selected_revision": _accepted_view_revision,
 	}
@@ -532,27 +536,33 @@ func _try_promote(group_id: String) -> bool:
 	if not _replacement_groups.has(group_id):
 		return false
 	var group: Dictionary = _replacement_groups[group_id]
+	var parent_missing := false
 	var was_active := false
 	for parent_id in group["parent_ids"]:
 		var id := String(parent_id)
 		if not _loaded_tiles.has(id):
-			return false
+			parent_missing = true
+			continue
 		was_active = was_active or _loaded_tiles[id]["wrapper"].visible
+	# Only a root cut has no coarser fallback to overlap. A missing nested
+	# parent must keep its complete descendants staged behind that ancestor.
+	if parent_missing and String(group["fallback_parent"]) != "":
+		return false
 	for child_id in group["required_ids"]:
 		if not _coverage_ready(String(child_id)):
 			return false
 	group["promoted"] = true
-	if was_active:
+	if was_active or parent_missing:
 		for parent_id in group["parent_ids"]:
-			_loaded_tiles[String(parent_id)]["wrapper"].visible = false
+			var id := String(parent_id)
+			if _loaded_tiles.has(id):
+				_loaded_tiles[id]["wrapper"].visible = false
 		for child_id in group["required_ids"]:
 			_show_coverage(String(child_id))
 	return true
 
 
 func _show_coverage(id: String) -> void:
-	if not _loaded_tiles.has(id):
-		return
 	var group_id := String(_parent_groups.get(id, ""))
 	if group_id != "" and _replacement_groups.get(group_id, {}).get("promoted", false):
 		for parent_id in _replacement_groups[group_id]["parent_ids"]:
@@ -560,7 +570,7 @@ func _show_coverage(id: String) -> void:
 				_loaded_tiles[String(parent_id)]["wrapper"].visible = false
 		for child_id in _replacement_groups[group_id]["required_ids"]:
 			_show_coverage(String(child_id))
-	else:
+	elif _loaded_tiles.has(id):
 		_loaded_tiles[id]["wrapper"].visible = true
 
 
@@ -574,20 +584,17 @@ func _hide_coverage(id: String) -> void:
 
 
 func _coverage_ready(id: String) -> bool:
-	if not _loaded_tiles.has(id):
-		return false
 	var group_id := String(_parent_groups.get(id, ""))
 	if group_id != "" and _replacement_groups.get(group_id, {}).get("promoted", false):
 		for child_id in _replacement_groups[group_id]["required_ids"]:
 			if not _coverage_ready(String(child_id)):
 				return false
-	return true
+		return true
+	return _loaded_tiles.has(id)
 
 
 func _has_active_coverage(id: String) -> bool:
-	if not _loaded_tiles.has(id):
-		return false
-	if _loaded_tiles[id]["wrapper"].visible:
+	if _loaded_tiles.has(id) and _loaded_tiles[id]["wrapper"].visible:
 		return true
 	var group_id := String(_parent_groups.get(id, ""))
 	if group_id != "" and _replacement_groups.get(group_id, {}).get("promoted", false):
@@ -640,6 +647,15 @@ func _apply_selection(event: Dictionary) -> void:
 				parents_ready = false
 				break
 		if not parents_ready:
+			var parent_still_desired := false
+			for parent_id in group["parent_ids"]:
+				parent_still_desired = parent_still_desired \
+						or _current_desired_ids.has(String(parent_id))
+			if group["promoted"] and String(group["fallback_parent"]) == "" \
+					and not parent_still_desired:
+				for child_id in group["required_ids"]:
+					_hide_coverage(String(child_id))
+				group["promoted"] = false
 			if not group["promoted"]:
 				for parent_id in group["parent_ids"]:
 					_parent_groups.erase(String(parent_id))
@@ -1110,6 +1126,7 @@ func _walk_tile_live(tile: Dictionary, parent_transform: Transform3D, base_url: 
 		transitions.append({
 			"parent_ids": own_ids,
 			"required_ids": child_coverage,
+			"fallback_parent": pending_parent,
 		})
 		# Ancestors replace this tile as one geographical unit, not with its
 		# currently visible descendants. This keeps relations view-independent.
