@@ -345,12 +345,12 @@ It must never be committed or hardcoded.
 ### Live streaming (`GWTiles3DStreamer`) — the real path
 
 `GWTiles3DStreamer` (`addons/godotwings/world/Tiles3DStreamer.gd`) fetches
-real tile content around the vehicle's current position **every session**
-and holds it in memory only — nothing is ever written to disk. This is the
-only path here that actually satisfies Cesium ion's and Google's terms: an
-earlier bounded-prefetch design (download once, cache to disk, fly with zero
-network access — see below) turned out to violate them outright, pulled
-live from the actual current terms, not assumed:
+real tile content for the render cameras and nearby vehicle **every session**
+and holds tiles in memory, without a persistent cache. This avoids the
+offline-storage issue of an earlier bounded-prefetch design (download once,
+cache to disk, fly with zero network access — see below), but does not establish
+permission for every simulation or recording use. Check the applicable provider
+terms, including these storage restrictions:
 
 - Cesium ion ToS §2.2.2 (`cesium.com/legal/terms-of-service/`): "You may not
   copy, store, or redistribute any portion of Cesium Data Output in, or for
@@ -366,39 +366,52 @@ Drop a `GWTiles3DStreamer` node anywhere in the scene (it auto-finds the
 first `GWVehicleBody`, same pattern as `GWFloatingOrigin`) and set
 `home_lat`/`home_lon`/`home_alt` to match the vehicle's actual home position
 (e.g. `HOME_LOCATION`), plus `asset_id` (`2275207` = Google Photorealistic 3D
-Tiles). It resolves the ion asset, then streams tiles within
-`streaming_radius_km` of the vehicle's *live* position on two independent
-cadences:
+Tiles). Camera-dependent detail replaces the former metre-error near/far rings:
 
-- every `poll_interval_s` (default 5s) it re-evaluates what should be loaded
-  around wherever the vehicle currently is, adding whatever's newly in range
-  and evicting whatever fell out — tiles stream in/out progressively as you
-  fly, not as one big chunk;
+- `maximum_screen_space_error` is a pixel-error target (default 4px). A
+  narrower field of view or larger render viewport requests finer geometry.
+- `streaming_radius_km` retains coarse local safety coverage (default 1km),
+  including areas outside the camera views. `far_radius_km` controls the
+  camera-visible selection range (default 40km), not a second detail threshold.
+- `set_cameras()` registers perspective `Camera3D` views, including offscreen
+  sensor viewports. Selection uses the largest projected error across them.
+  With no explicit cameras, the active root-viewport camera is used.
+- Every `poll_interval_s` (default 0.25s), camera poses, fields of view, viewport
+  sizes and the vehicle target are sampled for the next selection;
 - separately, once the vehicle drifts past `reanchor_distance_m`, the
   *render frame's* anchor shifts and every already-loaded tile repositions
   instantly from its stored real-world transform (no re-fetch) — this only
   bounds the flat-tangent approximation error, it doesn't drive streaming.
 
-A background thread does all the fetching; results cross back to the main
-thread via a queue it drains every frame (mirrors `GWSITLBridge`'s pattern
-exactly) so none of this ever blocks the physics loop.
+The background thread performs traversal and sequential HTTP requests. Each
+selection admits coarse coverage before refining it, and complete replacement
+groups keep their parents visible until every required child is available.
+At the root, a failed coarse payload does not block an otherwise complete child
+cut. Missing intermediate payloads keep descendants staged only while an
+ancestor fallback is visible; without one, complete descendants provide the
+coverage instead.
+New coarse coverage does not discard detail that is already visible. Changed
+camera targets interrupt the old payload queue after a small progress batch.
+Local-safety payloads are requested before distant-only payloads, preserving
+selection order within each class. Metadata and payload request failures share
+throttled, credential-safe engine diagnostics.
+The local-safety footprint is horizontal, so flight altitude does not remove
+the ground beneath the vehicle from selection.
 
-**Keep `streaming_radius_km` small (a couple km)** — coverage over a large
-operating area comes from flying and reanchoring repeatedly, not from
-setting one big radius upfront. Every fetch in a pass is sequential on the
-one background thread, so a large radius means a large multiple of tiles to
-walk before the first one ever appears: 10km never finished a single pass in
-90 seconds against the real Google asset, while 1km finished in ~4s.
+`max_tiles_loaded` bounds resident tile instances (default 1536), and
+`tiles_per_frame_budget` bounds main-thread tile placement per frame (default
+4). When the detail budget fills, remaining branches retain coarse coverage;
+the highest projected errors receive refinement first. The error setting is
+therefore a target, not a guarantee that every visible tile meets it.
 
-**Simple two-level LOD**: a second, wider/coarser ring loads alongside the
-near one above, controlled by `far_radius_km`/`far_detail_m` (defaults 5km /
-100m, vs. `streaming_radius_km`/`detail_m`'s 2km / 30m). Every poll walks the
-tileset twice — once at the near radius/detail, once at the far one — and the
-far pass skips any tile within `streaming_radius_km` of the vehicle, since
-the near pass already covers that area at better detail. The result is a
-wide low-detail area with a smaller high-detail area overlaid on top of it,
-without the two overlapping or z-fighting. Set `far_radius_km <=
-streaming_radius_km` to disable the far ring entirely (it becomes a no-op).
+If every slot belongs to the retained detailed cut, new coarse payloads wait
+until a complete selection permits safe eviction. A failed detailed traversal
+therefore preserves that cut rather than exceeding the residency cap.
+
+Lower pixel-error targets can require substantially more data and take minutes
+to finish over a slow connection. Network/traversal work is off the main thread,
+but an individual GLB import still runs on it and can cause a frame-time spike.
+There is no persistent tile cache.
 
 **Attribution is required, not optional**: `GWTiles3DStreamer.attributions`
 is populated once the asset resolves — Cesium ion's and the content

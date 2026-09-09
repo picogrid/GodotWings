@@ -98,128 +98,105 @@ func _get_property_list() -> Array:
 		"usage": PROPERTY_USAGE_EDITOR,  # deliberately no PROPERTY_USAGE_STORAGE
 	}]
 
-## The GWVehicleBody to track. Empty = auto-find the first one in the scene
-## (same pattern as GWFloatingOrigin).
+## The GWVehicleBody to track. Empty auto-finds the first one in the scene.
 @export var vehicle_path: NodePath
 
-## Keep this SMALL (a few km) -- the design is small-radius-plus-continuous-
-## reanchoring, not one big upfront radius. Every fetch in a pass is
-## sequential on the one background thread, so a large radius means a large
-## multiple of tiles to walk before the first one ever appears -- found
-## live: 10km never finished a pass in 90s (likely tens of thousands of
-## tiles for this asset's density), while 1km finished in ~4s. Coverage over
-## a big operating area comes from flying and reanchoring repeatedly, not
-## from raising this.
-@export var streaming_radius_km: float = 2.0
-@export var detail_m: float = 30.0
-## Simple two-level LOD: an optional wider, coarser ring loaded alongside
-## the near ring above. Low-detail content streams in over a LARGER area,
-## and the near ring's higher-detail content overlays it within its own
-## smaller radius -- tiles inside streaming_radius_km are skipped for this
-## far ring entirely (the near ring already covers them at better detail),
-## so the two rings never overlap/z-fight. Set far_radius_km <=
-## streaming_radius_km to disable this (the far ring becomes a no-op).
-@export var far_radius_km: float = 5.0
-@export var far_detail_m: float = 100.0
-## Re-anchor the RENDER FRAME once the vehicle drifts this far from the
-## current anchor (reposition already-loaded tiles from their stored ECEF
-## transform, no re-fetch). Kept small (a few km) on purpose -- it bounds
-## the flat-tangent/AEQD approximation error in the traversal/pruning math,
-## not tied to GWGeoReference's unrelated 5000m default (a different
-## system, for a different purpose -- see the class doc comment). This is
-## now INDEPENDENT of how often tiles stream in/out -- see poll_interval_s.
+## Cameras drive visible-detail selection. streaming_radius_km is a bounded,
+## coarse safety area around the vehicle for collision and placement even when
+## it is outside every camera. far_radius_km bounds all visible coverage.
+@export var streaming_radius_km: float = 1.0
+@export var far_radius_km: float = 40.0
+@export var maximum_screen_space_error: float = 4.0
 @export var reanchor_distance_m: float = 2000.0
-## How often (seconds) to re-evaluate what should be loaded around the
-## vehicle's CURRENT position, independent of reanchor_distance_m --
-## without this, tiles only ever changed at the rare, large reanchor jumps,
-## which looked like a big chunk swap rather than tiles streaming in/out
-## progressively as you fly. Keep this comfortably longer than a pass
-## actually takes (a few seconds for a 1-2km radius): polling faster than a
-## pass can complete means passes keep getting superseded before finishing
-## and nothing ever streams in at all (harmless -- the generation check
-## below still prevents incorrect evictions -- just wasteful).
-@export var poll_interval_s: float = 5.0
-## Safety cap: never instantiate more than this many tiles at once,
-## regardless of how many the traversal finds within streaming_radius_km.
-@export var max_tiles_loaded: int = 300
-## Instantiate at most this many newly-arrived tiles per frame, so a burst
-## of arrivals (e.g. right after a reanchor) doesn't stutter a frame.
+@export var poll_interval_s: float = 0.25
+@export var max_tiles_loaded: int = 1536
 @export var tiles_per_frame_budget: int = 4
-## Keep a loaded tile until it is this many times streaming_radius_km from the
-## vehicle's CURRENT position, rather than dropping it the moment a pass's area
-## of interest no longer covers it.
-##
-## Without a margin, every applied pass prunes back to a circle around wherever
-## the vehicle was when that pass STARTED -- tens of seconds ago. Flying a
-## circle, that wipes most of what is loaded each time and reloads it moments
-## later: measured on a 2.5km circle, 174 tiles down to 47, then 137 down to
-## 34. The ground visibly blinks out and refills. 1.0 reproduces that; the
-## default keeps anything still plausibly in view.
-@export var evict_margin: float = 2.5
-## Centre the area of interest this many seconds AHEAD of the vehicle along its
-## own velocity, instead of on where it is right now.
-##
-## A pass takes tens of seconds against a real asset and places nothing until
-## it finishes, so an area of interest centred on the current position always
-## delivers content for where the vehicle already was -- at 30 m/s, a 20s pass
-## lands 600m behind. Leading the area by roughly one pass duration means the
-## tiles arrive about where the vehicle will be when they do. 0 restores
-## centring on the current position.
 @export var lookahead_s: float = 20.0
 
-## Attribution HTML snippets from the ion endpoint response, populated once
-## the background thread resolves the asset. Cesium ion's and the content
-## provider's terms REQUIRE these be displayed wherever the content itself
-## is shown to anyone besides you -- render them in your own UI.
+const MAX_PENDING_RESULTS := 256
+const MAX_INCOMING_TILES := 256
+const MAX_TILESET_DOCUMENTS := 4096
+
+## Attribution HTML snippets from the ion endpoint response.
 var attributions: Array = []
 
 var _vehicle: GWVehicleBody
+var _explicit_cameras := false
+var _camera_refs: Array[WeakRef] = []
+var _warned_orthographic := false
 var _has_anchor := false
 var _anchor_lat := 0.0
 var _anchor_lon := 0.0
 var _anchor_alt := 0.0
 var _content_axis_correction := ""
-var _time_since_poll := 1e9  ## huge, so the very first _process() call polls immediately
+var _time_since_poll := 1e9
+var _anchor_generation := 0
+var _view_revision := 0
+var _accepted_view_revision := -1
+var _accepted_plan_serial := -1
 
-## id (stripped content URL) -> {"wrapper": Node3D, "ecef_transform": Transform3D}
+## id -> wrapper and immutable placement metadata. Hidden wrappers are staged
+## REPLACE children or retained fallbacks, never simultaneously active opaque
+## coverage with their replacement descendants.
 var _loaded_tiles: Dictionary = {}
-var _incoming_tiles: Array = []  ## FIFO of tiles the thread found but haven't been instantiated yet
+var _wrapper_entries: Dictionary = {}
+var _incoming_tiles: Array = []
+var _replacement_groups: Dictionary = {}
+var _parent_groups: Dictionary = {}
+var _current_desired_ids: Dictionary = {}
+var _accepted_fine_desired_ids: Dictionary = {}
+var _protected_tile_ids: Dictionary = {}
 
 var _thread: Thread
 var _mutex: Mutex
 var _wake_sem: Semaphore
 var _running := false
+var _wake_posted := false
 
-# --- shared state (guard with _mutex) ---------------------------------------
+# Shared state guarded by _mutex.
 var _target_lat := 0.0
 var _target_lon := 0.0
 var _target_alt := 0.0
+var _target_anchor_lat := 0.0
+var _target_anchor_lon := 0.0
+var _target_anchor_alt := 0.0
+var _target_local_center := Vector3.ZERO
 var _target_radius_km := 0.0
 var _target_far_radius_km := 0.0
-var _target_far_detail_m := 0.0
+var _target_maximum_sse := 0.0
 var _target_generation := 0
+var _target_view_revision := 0
+var _target_change_revision := 0
+var _target_views: Array = []
 var _known_ids := PackedStringArray()
-var _pending_results: Array = []  ## [{"new_tiles": [...], "evict_ids": PackedStringArray, "generation": int}]
-var _pending_info: Array = []     ## [{"error": String} | {"attributions": Array}]
+var _pending_results: Array = []
+var _pending_plans: Dictionary = {}
+var _pending_info: Array = []
 
-## Main-thread-only: bumped every _reanchor(). A pass's results are tagged
-## with whatever generation was current when the thread started that pass --
-## if a NEWER reanchor has since superseded it (the pass took longer than
-## the time between two reanchors, e.g. flying fast with a small
-## reanchor_distance_m), its evictions are stale and must be discarded
-## rather than applied: found live, applying them anyway could evict tiles
-## that are still genuinely in range of the CURRENT anchor just because an
-## outdated pass's AOI didn't happen to include them, and once nothing new
-## ever catches up, everything vanishes and never comes back. New tiles
-## from a stale pass are still real content, just placed at a position
-## recomputed fresh against the CURRENT anchor rather than trusting the
-## stale one baked in at fetch time.
-var _anchor_generation := 0
+# Thread-local session state. Documents and payloads never leave memory.
+var _auth_params: Array = []
+var _tileset_root_url := ""
+var _is_google := false
+var _document_cache: Dictionary = {}
+var _selection_budget_exhausted := false
+var _next_request_failure_report_msec := 0
+
+
+## Configure every render camera that must participate in selection. Weak
+## references keep cameras safe across SubViewport teardown. An empty array
+## restores standalone active-root-viewport camera discovery.
+func set_cameras(cameras: Array[Camera3D]) -> void:
+	_explicit_cameras = not cameras.is_empty()
+	_camera_refs.clear()
+	for camera in cameras:
+		if is_instance_valid(camera):
+			_camera_refs.append(weakref(camera))
+	_time_since_poll = 1e9
 
 
 func _ready() -> void:
 	if Engine.is_editor_hint():
-		return  # @tool exists only so set_ion_token's getter runs while editing (see class doc comment) -- no network/thread activity here
+		return
 	_vehicle = _resolve_vehicle()
 	if _vehicle == null:
 		push_warning("GWTiles3DStreamer: no GWVehicleBody found to track.")
@@ -233,11 +210,11 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	if _mutex == null:
-		return  # _ready() bailed early (no vehicle found) -- nothing was started
+		return
 	_mutex.lock()
 	_running = false
 	_mutex.unlock()
-	_wake_sem.post()  # unblock the thread if it's parked waiting for work
+	_wake_sem.post()
 	if _thread and _thread.is_started():
 		_thread.wait_to_finish()
 
@@ -248,7 +225,6 @@ func _resolve_vehicle() -> GWVehicleBody:
 	return _find_flight_body(_scene_root())
 
 
-## Same pattern as GWFloatingOrigin._scene_root()/_find_flight_body().
 func _scene_root() -> Node:
 	var n: Node = self
 	var top := get_tree().root if get_tree() else null
@@ -270,12 +246,7 @@ func _find_flight_body(n: Node) -> GWVehicleBody:
 func _process(delta: float) -> void:
 	if _vehicle == null:
 		return
-
-	var pos_ned: Vector3 = _vehicle._pos_ned  # established convention: GWCamera/GWGeoReference already reach into this
-	# Stream for where the vehicle is heading, not where it is. The lead is
-	# capped at the streaming radius: beyond that the area of interest would no
-	# longer cover the vehicle itself, which is the one place ground is
-	# definitely needed.
+	var pos_ned: Vector3 = _vehicle._pos_ned
 	if lookahead_s > 0.0:
 		var lead: Vector3 = _vehicle._vel_ned * lookahead_s
 		var max_lead := streaming_radius_km * 1000.0
@@ -286,226 +257,506 @@ func _process(delta: float) -> void:
 	var lat: float = geo[0]
 	var lon: float = geo[1]
 	var alt: float = geo[2]
-
 	if not _has_anchor:
-		_reanchor(lat, lon, alt)  # also does the very first poll
+		_reanchor(lat, lon, alt)
 	else:
 		var dist := GWGeodeticConvert.geodetic_to_ned(lat, lon, alt, _anchor_lat, _anchor_lon, _anchor_alt).length()
 		if dist > reanchor_distance_m:
 			_reanchor(lat, lon, alt)
-
-	# Independent of reanchoring: without this, what's loaded only ever
-	# changed at the rare, large reanchor jumps, which looked like a big
-	# chunk swap rather than tiles streaming in/out progressively as you
-	# fly. Each poll's delta is small (however far the vehicle moved in
-	# poll_interval_s), so only the tiles actually at the edge of the AOI
-	# change between one poll and the next.
 	_time_since_poll += delta
 	if _time_since_poll >= poll_interval_s:
-		_time_since_poll = 0.0
 		_poll(lat, lon, alt)
-
 	_drain_results()
 
 
-## Wakes the background thread to re-evaluate the area of interest around
-## (lat, lon, alt) -- called periodically from _process() (see
-## poll_interval_s) and once immediately whenever _reanchor() runs, so a
-## fresh anchor gets evaluated right away rather than waiting out the next
-## poll interval.
+func _camera_snapshots() -> Array:
+	var cameras: Array[Camera3D] = []
+	if _explicit_cameras:
+		var retained: Array[WeakRef] = []
+		for ref in _camera_refs:
+			var camera := ref.get_ref() as Camera3D
+			if is_instance_valid(camera):
+				cameras.append(camera)
+				retained.append(ref)
+		_camera_refs = retained
+	else:
+		var viewport := get_viewport()
+		var camera := viewport.get_camera_3d() if viewport != null else null
+		if is_instance_valid(camera):
+			cameras.append(camera)
+	var views := []
+	var inverse_basis := global_transform.basis.inverse()
+	for camera in cameras:
+		if not camera.is_inside_tree() or camera.get_viewport() == null:
+			continue
+		if camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
+			if not _warned_orthographic:
+				push_warning("GWTiles3DStreamer: orthographic cameras do not participate in terrain LOD selection.")
+				_warned_orthographic = true
+			continue
+		var size := camera.get_viewport().get_visible_rect().size
+		if size.y <= 0.0 or size.x <= 0.0:
+			continue
+		var aspect := size.x / size.y
+		var tan_x: float
+		var tan_y: float
+		if camera.keep_aspect == Camera3D.KEEP_HEIGHT:
+			tan_y = tan(deg_to_rad(camera.fov) * 0.5)
+			tan_x = tan_y * aspect
+		else:
+			tan_x = tan(deg_to_rad(camera.fov) * 0.5)
+			tan_y = tan_x / aspect
+		var camera_transform := camera.get_camera_transform()
+		var basis := camera_transform.basis
+		views.append({
+			"position": to_local(camera_transform.origin),
+			"forward": (inverse_basis * -basis.z).normalized(),
+			"right": (inverse_basis * basis.x).normalized(),
+			"up": (inverse_basis * basis.y).normalized(),
+			"tan_half_fov_x": tan_x,
+			"tan_half_fov_y": tan_y,
+			"viewport_height": float(size.y),
+			"near": camera.near,
+			"far": camera.far,
+		})
+	return views
+
+
+## Coalesce targets without cancelling an in-flight traversal. Completed plans
+## remain useful; payload downloading yields to a changed view after a small
+## batch, rather than delaying a camera switch behind the entire old cut.
 func _poll(lat: float, lon: float, alt: float) -> void:
+	_view_revision += 1
+	var views := _camera_snapshots()
 	_mutex.lock()
+	if lat != _target_lat or lon != _target_lon or alt != _target_alt \
+			or _anchor_generation != _target_generation or views != _target_views \
+			or streaming_radius_km != _target_radius_km or far_radius_km != _target_far_radius_km \
+			or maximum_screen_space_error != _target_maximum_sse:
+		_target_change_revision = _view_revision
 	_target_lat = lat
 	_target_lon = lon
 	_target_alt = alt
+	_target_anchor_lat = _anchor_lat
+	_target_anchor_lon = _anchor_lon
+	_target_anchor_alt = _anchor_alt
+	var target_ned := GWGeodeticConvert.geodetic_to_ned(lat, lon, alt, _anchor_lat, _anchor_lon, _anchor_alt)
+	_target_local_center = GWCoordConvert.ned_to_world(target_ned)
 	_target_radius_km = streaming_radius_km
 	_target_far_radius_km = far_radius_km
-	_target_far_detail_m = far_detail_m
+	_target_maximum_sse = maximum_screen_space_error
 	_target_generation = _anchor_generation
-	_known_ids = PackedStringArray(_loaded_tiles.keys())
+	_target_view_revision = _view_revision
+	_target_views = views
+	var known := PackedStringArray(_loaded_tiles.keys())
+	for tile in _incoming_tiles:
+		known.append(String(tile["id"]))
+	for tile in _pending_results:
+		known.append(String(tile["id"]))
+	_known_ids = known
+	if not _wake_posted:
+		_wake_posted = true
+		_wake_sem.post()
 	_mutex.unlock()
-	_wake_sem.post()
 	_time_since_poll = 0.0
 
 
-## Recompute every already-loaded tile's Godot position fresh from its
-## stored raw ECEF transform, relative to the new anchor -- no re-fetch
-## needed. This avoids the curvature drift a naive "shift by a flat delta"
-## would accumulate over a long flight (unlike GWFloatingOrigin's rebase,
-## which is a flat shift for a DIFFERENT purpose -- keeping render-space
-## numbers small -- and is fine as a flat shift for that). This no longer
-## drives tile streaming itself -- see poll_interval_s/_poll() -- it just
-## keeps the render frame's numbers bounded and repositions what's already
-## loaded; it still triggers one immediate poll so a fresh anchor doesn't
-## sit idle until the next scheduled one.
-##
-## Crucially, this node's OWN position is moved too -- not just its
-## children. Every wrapper's position is "offset from the anchor," so
-## unless this node ALSO moves to where the anchor now sits (relative to
-## home, in the SAME frame GWVehicleBody's own render position uses), every
-## reanchor recomputes all children relative to a new reference point while
-## the parent stays put: found live as periodic large jumps in the ground
-## every time the anchor moved, roughly reanchor_distance_m in size. Setting
-## it here keeps tile positions consistent with the vehicle's own render
-## position (ned_to_world(pos_ned), always relative to home) regardless of
-## how many times this has reanchored, and is exactly what makes this node
-## behave correctly as a GWFloatingOrigin shift_node too, if one is present.
 func _reanchor(lat: float, lon: float, alt: float) -> void:
-	# Bumped here and ONLY here: the eviction guard in _drain_results uses this
-	# to spot a pass whose AOI was computed against a superseded anchor. It used
-	# to be bumped in _poll() instead, which runs every poll_interval_s -- so
-	# for any pass slower than one poll (they take tens of seconds against a
-	# real asset, polls default to 5s) the guard never matched and evictions
-	# were silently dropped every time. Tiles then accumulated until
-	# max_tiles_loaded, after which newly fetched tiles could not be placed at
-	# all: flying on, the ground ahead stayed empty while stale tiles behind
-	# were kept forever. Measured on a 2.5km circle: 46 tiles rising
-	# monotonically to exactly 300, with zero evictions applied.
 	_anchor_generation += 1
 	_has_anchor = true
 	_anchor_lat = lat
 	_anchor_lon = lon
 	_anchor_alt = alt
-
-	var anchor_ned: Vector3 = GWGeodeticConvert.geodetic_to_ned(lat, lon, alt, home_lat, home_lon, home_alt)
+	var anchor_ned := GWGeodeticConvert.geodetic_to_ned(lat, lon, alt, home_lat, home_lon, home_alt)
 	position = GWCoordConvert.ned_to_world(anchor_ned)
-
 	for id in _loaded_tiles:
 		var entry: Dictionary = _loaded_tiles[id]
-		var wrapper_transform: Transform3D = GWTiles3DTraversal.local_transform_to_godot(
-				entry["ecef_transform"], lat, lon, alt)
+		var xform := GWTiles3DTraversal.local_transform_to_godot(entry["ecef_transform"], lat, lon, alt)
 		if _content_axis_correction == "google_yup_ecef":
-			wrapper_transform.basis = wrapper_transform.basis * GWTiles3DContent.GOOGLE_YUP_ECEF_CORRECTION
-		entry["wrapper"].transform = wrapper_transform
-
+			xform.basis = xform.basis * GWTiles3DContent.GOOGLE_YUP_ECEF_CORRECTION
+		entry["wrapper"].transform = xform
+		entry["bounds"] = GWTiles3DTraversal.bounding_sphere(
+				entry.get("bounding_volume", {}), entry["ecef_transform"], lat, lon, alt)
 	_poll(lat, lon, alt)
 
 
 func _drain_results() -> void:
+	var room := maxi(MAX_INCOMING_TILES - _incoming_tiles.size(), 0)
 	_mutex.lock()
-	var batches := _pending_results
-	_pending_results = []
+	var results := []
+	while room > 0 and not _pending_results.is_empty():
+		results.append(_pending_results.pop_front())
+		room -= 1
+	var plans := _pending_plans.values()
+	_pending_plans.clear()
 	var infos := _pending_info
 	_pending_info = []
 	_mutex.unlock()
-
 	for info in infos:
 		if info.has("error"):
 			push_error(info["error"])
-		if info.has("attributions"):
+		elif info.has("attributions"):
 			attributions = info["attributions"]
-			for html in attributions:
-				push_warning("GWTiles3DStreamer: attribution required by the content provider's terms -- render this in your own UI: %s" % html)
-		if info.has("content_axis_correction"):
-			_content_axis_correction = info["content_axis_correction"]
-		if info.has("stats"):
-			var s: Dictionary = info["stats"]
-			var aoi: Dictionary = info["aoi"]
-			print("GWTiles3DStreamer: pass at (%.6f, %.6f) r=%.2fkm far_r=%.2fkm -- visited=%d pruned=%d excluded=%d downloaded=%d http_errors=%d" %
-					[aoi["lat"], aoi["lon"], aoi["radius_km"], aoi.get("far_radius_km", 0.0), s["visited"], s["pruned"], s.get("excluded", 0), s["downloaded"], s["http_errors"]])
-			if s["visited"] == 1 and s["pruned"] == 1:
-				push_warning("GWTiles3DStreamer: the tileset root itself was pruned -- home_lat/home_lon likely doesn't overlap " +
-						"real content for this asset (e.g. open ocean), or streaming_radius_km is too small.")
-			if s["http_errors"] > 0 and s["downloaded"] == 0:
-				push_warning("GWTiles3DStreamer: every request this pass failed (http_errors=%d) -- check network access " %
-						s["http_errors"] + "and that the ion token/asset are actually valid (a resolve failure would have " +
-						"already errored separately; this means the ion asset resolved but tileset/content requests are failing).")
+			_content_axis_correction = info.get("content_axis_correction", "")
 
-	var got_new_tiles := false
-	for batch in batches:
-		# A pass started under an OLDER anchor than the current one (a newer
-		# reanchor superseded it before it finished) has evictions based on
-		# an outdated area -- applying them could remove tiles that are
-		# still genuinely in range of the CURRENT anchor just because that
-		# stale pass's AOI didn't happen to cover them. Found live: without
-		# this, reanchoring while a pass was still in flight made everything
-		# vanish and never come back, because no later pass ever "caught up"
-		# to re-add what the stale one wrongly evicted. New tiles are still
-		# real content either way -- just placed at a position recomputed
-		# fresh against the CURRENT anchor (see _place_new_tile) rather than
-		# trusting whatever anchor was active when they were fetched.
-		if int(batch["generation"]) == _anchor_generation:
-			# The pass proposes what its own area of interest no longer covers;
-			# whether a tile actually goes is decided here against the
-			# vehicle's live position, which has moved on since.
-			var keep_radius := streaming_radius_km * 1000.0 * maxf(evict_margin, 1.0)
-			var vehicle_pos := GWCoordConvert.ned_to_world(_vehicle._pos_ned) if _vehicle != null else Vector3.ZERO
-			for id in batch["evict_ids"]:
-				if not _loaded_tiles.has(id):
-					continue
-				# Deliberately NOT the wrapper's own position: for Google tiles
-				# that is ~Earth-center-relative and identical for every tile
-				# in a pass (see approx_position's doc comment), so using it
-				# put every tile ~18000m away and evicted the lot.
-				var e: Vector3 = _loaded_tiles[id].get("approx_ecef", Vector3.ZERO)
-				if e == Vector3.ZERO:
-					continue  # unknown position: keep it rather than guess
-				var tile_pos: Vector3 = position + GWGeodeticConvert.ecef_xyz_to_godot_position(
-						e.x, e.y, e.z, _anchor_lat, _anchor_lon, _anchor_alt)
-				if tile_pos.distance_to(vehicle_pos) > keep_radius:
-					_evict_tile(id)
-		for tile in batch["new_tiles"]:
-			if not _loaded_tiles.has(tile["id"]):
-				_incoming_tiles.append(tile)
-				got_new_tiles = true
-
-	# Nearest-first, not traversal-order: a tileset's own tree order has no
-	# relation to distance from the anchor, so without this a tile 1km away
-	# could sit ahead of the queue while the one right under the vehicle is
-	# still waiting its turn under a small per-frame budget -- found live:
-	# the first tiles to actually appear were 800-1100m from the aircraft
-	# while it sat only ~60m from the camera.
-	if got_new_tiles:
-		_incoming_tiles.sort_custom(func(a, b): return a["approx_position"].length_squared() < b["approx_position"].length_squared())
+	# Control never waits behind payloads. A completed traversal is useful even
+	# when a newer camera snapshot was posted while its network requests ran.
+	plans.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return _plan_serial(a) < _plan_serial(b))
+	for plan in plans:
+		var serial := _plan_serial(plan)
+		if serial > _accepted_plan_serial:
+			_accepted_plan_serial = serial
+			_accepted_view_revision = int(plan["view_revision"])
+			_apply_selection(plan)
+	for event in results:
+		if not _loaded_tiles.has(event["id"]) and not _incoming_has(String(event["id"])):
+			_incoming_tiles.append(event)
 
 	var budget := tiles_per_frame_budget
-	while budget > 0 and _incoming_tiles.size() > 0 and _loaded_tiles.size() < max_tiles_loaded:
-		_place_new_tile(_incoming_tiles.pop_front())
+	while budget > 0 and not _incoming_tiles.is_empty():
+		var tile: Dictionary = _incoming_tiles.pop_front()
+		var id := String(tile["id"])
+		if _loaded_tiles.has(id):
+			continue
+		if _accepted_view_revision >= 0 and not _tile_needed(id):
+			continue
+		if not _make_room_for_tile():
+			_incoming_tiles.push_front(tile)
+			break
+		_place_new_tile(tile)
 		budget -= 1
+	_try_all_promotions()
+	_evict_safe_cached_tiles()
+
+
+func _incoming_has(id: String) -> bool:
+	for tile in _incoming_tiles:
+		if String(tile["id"]) == id:
+			return true
+	return false
+
+
+func _tile_needed(id: String) -> bool:
+	return _current_desired_ids.has(id) or _protected_tile_ids.has(id)
+
+
+func _rebuild_protected_tile_ids() -> void:
+	_protected_tile_ids.clear()
+	for group_id in _replacement_groups:
+		var group: Dictionary = _replacement_groups[group_id]
+		if group.get("promoted", false) \
+				or int(group.get("selected_revision", -1)) == _accepted_view_revision:
+			for id in group["parent_ids"]:
+				_protected_tile_ids[String(id)] = true
+			for id in group["required_ids"]:
+				_protected_tile_ids[String(id)] = true
+
+
+func _make_room_for_tile() -> bool:
+	if _loaded_tiles.size() < max_tiles_loaded:
+		return true
+	for id in _loaded_tiles.keys():
+		if not _tile_needed(String(id)):
+			_evict_tile(String(id))
+			return true
+	return false
 
 
 func _place_new_tile(tile: Dictionary) -> void:
-	# Recomputed fresh against the CURRENT anchor, not the (possibly several
-	# reanchors stale by now) wrapper_transform computed back when this tile
-	# was fetched -- same reasoning as the generation check above, just for
-	# position instead of eviction. ecef_transform is absolute and anchor-
-	# independent, so this is always correct regardless of how long the tile
-	# sat queued.
-	var wrapper_transform: Transform3D = GWTiles3DTraversal.local_transform_to_godot(
-			tile["ecef_transform"], _anchor_lat, _anchor_lon, _anchor_alt)
-	var wrapper := GWTiles3DContent.place_tile(self, tile["bytes"], wrapper_transform,
-			_content_axis_correction, String(tile["id"]).get_file())
+	var xform := GWTiles3DTraversal.local_transform_to_godot(tile["ecef_transform"], _anchor_lat, _anchor_lon, _anchor_alt)
+	var wrapper := GWTiles3DContent.place_tile(self, tile["bytes"], xform, _content_axis_correction, String(tile["id"]).validate_node_name())
 	if wrapper == null:
 		push_warning("GWTiles3DStreamer: failed to parse/place tile %s" % tile["id"])
 		return
-	_loaded_tiles[tile["id"]] = {
+	_accept_placed_tile(tile, wrapper)
+
+
+## Kept separate from GLB parsing so transition behavior is deterministic in
+## synthetic tests and a malformed payload cannot mutate fallback state.
+func _accept_placed_tile(tile: Dictionary, wrapper: Node3D) -> void:
+	var pending_parent := String(tile.get("pending_parent", ""))
+	var bounding_volume: Dictionary = tile.get("bounding_volume", {}).duplicate(true)
+	var bounds: Dictionary = tile.get("bounds", {"center": Vector3.ZERO, "radius": INF}).duplicate(true)
+	if not bounding_volume.is_empty():
+		bounds = GWTiles3DTraversal.bounding_sphere(
+				bounding_volume, tile["ecef_transform"], _anchor_lat, _anchor_lon, _anchor_alt)
+	wrapper.visible = pending_parent == ""
+	var entry := {
 		"wrapper": wrapper,
 		"ecef_transform": tile["ecef_transform"],
-		"approx_ecef": tile.get("approx_ecef", Vector3.ZERO),
+		"bounds": bounds,
+		"bounding_volume": bounding_volume,
+		"pending_parent": pending_parent,
 	}
+	_loaded_tiles[tile["id"]] = entry
+	_wrapper_entries[wrapper.get_instance_id()] = entry
+
+
+func _register_transition(event: Dictionary) -> void:
+	var parent_ids := PackedStringArray(event.get("parent_ids", []))
+	if parent_ids.is_empty() or not event.has("fallback_parent"):
+		return
+	var group_id := String(parent_ids[0])
+	var required_ids := PackedStringArray(event.get("required_ids", []))
+	if required_ids.is_empty():
+		return
+	for required_id in required_ids:
+		if String(required_id) in parent_ids:
+			return
+	var fallback_parent := String(event["fallback_parent"])
+	if _replacement_groups.has(group_id):
+		var existing: Dictionary = _replacement_groups[group_id]
+		# Parent/child relations come from immutable tileset metadata. Never
+		# reset a promoted cut merely because another view reports it again.
+		if existing["parent_ids"] == parent_ids \
+				and existing["required_ids"] == required_ids \
+				and String(existing["fallback_parent"]) == fallback_parent:
+			existing["selected_revision"] = _accepted_view_revision
+			return
+	_replacement_groups[group_id] = {
+		"parent_ids": parent_ids,
+		"required_ids": required_ids,
+		"fallback_parent": fallback_parent,
+		"promoted": false,
+		"selected_revision": _accepted_view_revision,
+	}
+	for parent_id in parent_ids:
+		_parent_groups[String(parent_id)] = group_id
+
+
+func _try_all_promotions() -> void:
+	for group_id in _replacement_groups.keys():
+		var group: Dictionary = _replacement_groups[group_id]
+		if int(group.get("selected_revision", -1)) == _accepted_view_revision:
+			_try_promote(String(group_id))
+
+
+func _fallback_chain_has_active_coverage(group: Dictionary) -> bool:
+	var fallback_id := String(group["fallback_parent"])
+	var remaining := _replacement_groups.size()
+	while fallback_id != "" and remaining > 0:
+		var fallback_group_id := String(_parent_groups.get(fallback_id, ""))
+		if fallback_group_id == "" or not _replacement_groups.has(fallback_group_id):
+			return _loaded_tiles.has(fallback_id) \
+					and _loaded_tiles[fallback_id]["wrapper"].visible
+		var fallback_group: Dictionary = _replacement_groups[fallback_group_id]
+		for parent_id in fallback_group["parent_ids"]:
+			var id := String(parent_id)
+			if _loaded_tiles.has(id) and _loaded_tiles[id]["wrapper"].visible:
+				return true
+		fallback_id = String(fallback_group["fallback_parent"])
+		remaining -= 1
+	return false
+
+
+func _fallback_chain_is_desired(group: Dictionary) -> bool:
+	var fallback_id := String(group["fallback_parent"])
+	var remaining := _replacement_groups.size()
+	while fallback_id != "" and remaining > 0:
+		var fallback_group_id := String(_parent_groups.get(fallback_id, ""))
+		if fallback_group_id == "" or not _replacement_groups.has(fallback_group_id):
+			return _current_desired_ids.has(fallback_id)
+		var fallback_group: Dictionary = _replacement_groups[fallback_group_id]
+		for parent_id in fallback_group["parent_ids"]:
+			if _current_desired_ids.has(String(parent_id)):
+				return true
+		fallback_id = String(fallback_group["fallback_parent"])
+		remaining -= 1
+	return false
+
+
+func _try_promote(group_id: String) -> bool:
+	if not _replacement_groups.has(group_id):
+		return false
+	var group: Dictionary = _replacement_groups[group_id]
+	var parent_missing := false
+	var was_active := false
+	for parent_id in group["parent_ids"]:
+		var id := String(parent_id)
+		if not _loaded_tiles.has(id):
+			parent_missing = true
+			continue
+		was_active = was_active or _loaded_tiles[id]["wrapper"].visible
+	# Missing intermediary payloads may expose a complete descendant cut only
+	# when no actual coarser wrapper is visible. Follow the authoritative
+	# fallback chain rather than inferring ancestry from unrelated groups.
+	if parent_missing and _fallback_chain_has_active_coverage(group):
+		return false
+	for child_id in group["required_ids"]:
+		if not _coverage_ready(String(child_id)):
+			return false
+	group["promoted"] = true
+	if was_active or parent_missing:
+		for parent_id in group["parent_ids"]:
+			var id := String(parent_id)
+			if _loaded_tiles.has(id):
+				_loaded_tiles[id]["wrapper"].visible = false
+		for child_id in group["required_ids"]:
+			_show_coverage(String(child_id))
+	return true
+
+
+func _show_coverage(id: String) -> void:
+	var group_id := String(_parent_groups.get(id, ""))
+	if group_id != "" and _replacement_groups.get(group_id, {}).get("promoted", false):
+		for parent_id in _replacement_groups[group_id]["parent_ids"]:
+			if _loaded_tiles.has(String(parent_id)):
+				_loaded_tiles[String(parent_id)]["wrapper"].visible = false
+		for child_id in _replacement_groups[group_id]["required_ids"]:
+			_show_coverage(String(child_id))
+	elif _loaded_tiles.has(id):
+		_loaded_tiles[id]["wrapper"].visible = true
+
+
+func _hide_coverage(id: String) -> void:
+	if _loaded_tiles.has(id):
+		_loaded_tiles[id]["wrapper"].visible = false
+	var group_id := String(_parent_groups.get(id, ""))
+	if group_id != "" and _replacement_groups.has(group_id):
+		for child_id in _replacement_groups[group_id]["required_ids"]:
+			_hide_coverage(String(child_id))
+
+
+func _coverage_ready(id: String) -> bool:
+	var group_id := String(_parent_groups.get(id, ""))
+	if group_id != "" and _replacement_groups.get(group_id, {}).get("promoted", false):
+		for child_id in _replacement_groups[group_id]["required_ids"]:
+			if not _coverage_ready(String(child_id)):
+				return false
+		return true
+	return _loaded_tiles.has(id)
+
+
+func _has_active_coverage(id: String) -> bool:
+	if _loaded_tiles.has(id) and _loaded_tiles[id]["wrapper"].visible:
+		return true
+	var group_id := String(_parent_groups.get(id, ""))
+	if group_id != "" and _replacement_groups.get(group_id, {}).get("promoted", false):
+		for child_id in _replacement_groups[group_id]["required_ids"]:
+			if not _has_active_coverage(String(child_id)):
+				return false
+		return true
+	return false
+
+
+func _apply_selection(event: Dictionary) -> void:
+	if int(event.get("phase", 1)) == 0:
+		# A new view can acquire coarse coverage while its detail is planned,
+		# without coarsening or evicting the already visible replacement cut.
+		_current_desired_ids.clear()
+		_current_desired_ids.merge(_accepted_fine_desired_ids, true)
+		for id in event["desired_ids"]:
+			_current_desired_ids[String(id)] = true
+		for group in _replacement_groups.values():
+			if int(group.get("selected_revision", -1)) >= 0:
+				group["selected_revision"] = _accepted_view_revision
+		_try_all_promotions()
+		_rebuild_protected_tile_ids()
+		return
+	_accepted_fine_desired_ids.clear()
+	for id in event["desired_ids"]:
+		_accepted_fine_desired_ids[String(id)] = true
+	_current_desired_ids.clear()
+	_current_desired_ids.merge(_accepted_fine_desired_ids, true)
+	var selected_groups := {}
+	for transition in event.get("transitions", []):
+		var parent_ids := PackedStringArray(transition.get("parent_ids", []))
+		if parent_ids.is_empty():
+			continue
+		var group_id := String(parent_ids[0])
+		selected_groups[group_id] = true
+		_register_transition(transition)
+
+	# Zoom-out is atomic too: restore every item of the coarse parent before
+	# hiding descendants. An unavailable desired fallback retains the old cut.
+	for group_id in _replacement_groups.keys():
+		var group: Dictionary = _replacement_groups[group_id]
+		if selected_groups.has(group_id):
+			group["selected_revision"] = _accepted_view_revision
+			continue
+		group["selected_revision"] = -1
+		var parents_ready := true
+		for parent_id in group["parent_ids"]:
+			if not _loaded_tiles.has(String(parent_id)):
+				parents_ready = false
+				break
+		if not parents_ready:
+			var fallback_still_desired := _fallback_chain_is_desired(group)
+			for parent_id in group["parent_ids"]:
+				fallback_still_desired = fallback_still_desired \
+						or _current_desired_ids.has(String(parent_id))
+			if group["promoted"] and not fallback_still_desired:
+				for child_id in group["required_ids"]:
+					_hide_coverage(String(child_id))
+				group["promoted"] = false
+			if not group["promoted"]:
+				for parent_id in group["parent_ids"]:
+					_parent_groups.erase(String(parent_id))
+				_replacement_groups.erase(group_id)
+			continue
+		var was_active := false
+		for parent_id in group["parent_ids"]:
+			was_active = was_active or _has_active_coverage(String(parent_id))
+		group["promoted"] = false
+		if was_active:
+			for parent_id in group["parent_ids"]:
+				_show_coverage(String(parent_id))
+		for child_id in group["required_ids"]:
+			_hide_coverage(String(child_id))
+
+	_try_all_promotions()
+	_rebuild_protected_tile_ids()
+
+
+func _evict_safe_cached_tiles() -> void:
+	for id in _loaded_tiles.keys():
+		if not _tile_needed(String(id)):
+			_evict_tile(String(id))
 
 
 func _evict_tile(id: String) -> void:
-	if _loaded_tiles.has(id):
-		_loaded_tiles[id]["wrapper"].queue_free()
-		_loaded_tiles.erase(id)
+	if not _loaded_tiles.has(id):
+		return
+	var wrapper: Node3D = _loaded_tiles[id]["wrapper"]
+	_wrapper_entries.erase(wrapper.get_instance_id())
+	wrapper.queue_free()
+	_loaded_tiles.erase(id)
+	var group_id := String(_parent_groups.get(id, ""))
+	if group_id != "" and _replacement_groups.has(group_id):
+		var group: Dictionary = _replacement_groups[group_id]
+		for parent_id in group["parent_ids"]:
+			_parent_groups.erase(String(parent_id))
+		_replacement_groups.erase(group_id)
+
+
+## Public horizontal collision filter. Collision interests are vertical terrain
+## probe columns, so altitude does not affect proximity. Unknown bounds
+## conservatively return true. The wrapper's visibility remains the
+## authoritative active-coverage signal.
+func is_tile_near_horizontal(tile: Node3D, world_position: Vector3, radius_m: float) -> bool:
+	if not is_instance_valid(tile):
+		return false
+	var entry = _wrapper_entries.get(tile.get_instance_id())
+	if entry == null:
+		return true
+	var bounds: Dictionary = entry.get("bounds", {"center": Vector3.ZERO, "radius": INF})
+	if not is_finite(float(bounds.get("radius", INF))):
+		return true
+	var center_world := global_transform * (bounds["center"] as Vector3)
+	return Vector2(center_world.x, center_world.z).distance_to(
+			Vector2(world_position.x, world_position.z)) <= radius_m + float(bounds["radius"])
 
 
 # -----------------------------------------------------------------------------
-# Thread: HTTP I/O and traversal only. Never touch the scene tree from here.
+# Thread: HTTP I/O and traversal only. Never touches Nodes or the scene tree.
 # -----------------------------------------------------------------------------
-
-var _auth_params: Array = []       ## thread-local only
-var _tileset_root_url := ""        ## thread-local only
-var _is_google := false            ## thread-local only
-
 
 func _stream_loop() -> void:
 	var ion_token := OS.get_environment(ion_token_env)
 	if ion_token == "":
 		_post_info({"error": "GWTiles3DStreamer: %s is not set -- export it before running (never commit a token)." % ion_token_env})
 		return
-
 	var resolved := _resolve_ion_asset(ion_token)
 	if not resolved["ok"]:
 		_post_info({"error": "GWTiles3DStreamer: " + String(resolved["error"])})
@@ -514,62 +765,70 @@ func _stream_loop() -> void:
 	_is_google = resolved["is_google"]
 	if String(resolved["auth_query"]) != "":
 		_auth_params = _ensure_param(_auth_params, resolved["auth_query"])
-	_post_info({"attributions": resolved["attributions"],
-			"content_axis_correction": "google_yup_ecef" if _is_google else ""})
-
-	while true:
+	_post_info({"attributions": resolved["attributions"], "content_axis_correction": "google_yup_ecef" if _is_google else ""})
+	var completed_revision := -1
+	while _thread_running():
 		_wake_sem.wait()
-		_mutex.lock()
-		var running := _running
-		var lat := _target_lat
-		var lon := _target_lon
-		var alt := _target_alt
-		var radius_km := _target_radius_km
-		var far_radius_km_snapshot := _target_far_radius_km
-		var far_detail_m_snapshot := _target_far_detail_m
-		var generation := _target_generation
-		var known_ids := PackedStringArray(_known_ids)
-		_mutex.unlock()
-		if not running:
+		if not _thread_running():
 			break
-
-		var aoi_center: Vector3 = GWGeodeticConvert.geodetic_to_ecef(lat, lon, alt)
-		var found_ids := {}
-		var new_tiles := []
-		var stats := {"visited": 0, "pruned": 0, "downloaded": 0, "http_errors": 0, "excluded": 0}
-
-		# Near ring: full detail, no exclusion -- unchanged behavior.
-		var aoi_bbox: Array = GWTiles3DTraversal.bbox_from_center(lat, lon, radius_km)
-		var visited_near := {}
-		_walk_tileset(_tileset_root_url, Transform3D.IDENTITY, aoi_bbox, aoi_center, radius_km * 1000.0,
-				lat, lon, alt, detail_m, 0.0, known_ids, found_ids, new_tiles, visited_near, stats)
-
-		# Far ring: simple two-level LOD -- a wider, coarser pass that skips
-		# whatever the near ring above already covers at better detail (see
-		# far_radius_km's doc comment). A fresh `visited` set is needed since
-		# this walks the SAME tileset tree again at a different detail_m
-		# threshold, so tiles the near pass pruned as "too coarse to bother"
-		# may legitimately have "content" here instead.
-		if far_radius_km_snapshot > radius_km:
-			var aoi_bbox_far: Array = GWTiles3DTraversal.bbox_from_center(lat, lon, far_radius_km_snapshot)
-			var visited_far := {}
-			_walk_tileset(_tileset_root_url, Transform3D.IDENTITY, aoi_bbox_far, aoi_center, far_radius_km_snapshot * 1000.0,
-					lat, lon, alt, far_detail_m_snapshot, radius_km * 1000.0, known_ids, found_ids, new_tiles, visited_far, stats)
-
-		var evict_ids := PackedStringArray()
-		for id in known_ids:
-			if not found_ids.has(id):
-				evict_ids.append(id)
-
-		# Always report a summary, even an all-zero one -- a silent pass looks
-		# identical to a hung/broken one otherwise, which cost real
-		# troubleshooting time before this existed.
-		_post_info({"stats": stats, "aoi": {"lat": lat, "lon": lon, "radius_km": radius_km, "far_radius_km": far_radius_km_snapshot}})
-
-		if new_tiles.size() > 0 or evict_ids.size() > 0:
+		while _thread_running():
 			_mutex.lock()
-			_pending_results.append({"new_tiles": new_tiles, "evict_ids": evict_ids, "generation": generation})
+			var snapshot := {
+				"lat": _target_lat, "lon": _target_lon, "alt": _target_alt,
+				"anchor_lat": _target_anchor_lat,
+				"anchor_lon": _target_anchor_lon,
+				"anchor_alt": _target_anchor_alt,
+				"local_center": _target_local_center,
+				"local_radius": _target_radius_km * 1000.0,
+				"far_radius": _target_far_radius_km * 1000.0,
+				"maximum_sse": _target_maximum_sse,
+				"generation": _target_generation,
+				"view_revision": _target_view_revision,
+				"views": _target_views.duplicate(true),
+				"known_ids": PackedStringArray(_known_ids),
+			}
+			_wake_posted = false
 			_mutex.unlock()
+			if int(snapshot["view_revision"]) == completed_revision:
+				break
+			_run_selection(snapshot)
+			completed_revision = int(snapshot["view_revision"])
+			_mutex.lock()
+			var newer := _target_view_revision != completed_revision
+			_mutex.unlock()
+			if not newer:
+				break
+
+
+func _thread_running() -> bool:
+	_mutex.lock()
+	var result := _running
+	_mutex.unlock()
+	return result
+
+
+func _post_result(event: Dictionary) -> bool:
+	_mutex.lock()
+	if _pending_results.size() >= MAX_PENDING_RESULTS:
+		_mutex.unlock()
+		return false
+	_pending_results.append(event)
+	_mutex.unlock()
+	return true
+
+
+func _post_plan(plan: Dictionary) -> void:
+	_mutex.lock()
+	_pending_plans[_plan_serial(plan)] = plan
+	while _pending_plans.size() > 4:
+		var revisions := _pending_plans.keys()
+		revisions.sort()
+		_pending_plans.erase(revisions[0])
+	_mutex.unlock()
+
+
+static func _plan_serial(plan: Dictionary) -> int:
+	return int(plan["view_revision"]) * 2 + int(plan.get("phase", 0))
 
 
 func _post_info(info: Dictionary) -> void:
@@ -577,6 +836,18 @@ func _post_info(info: Dictionary) -> void:
 	_pending_info.append(info)
 	_mutex.unlock()
 
+
+func _report_request_failure(resource_kind: String, resource_url: String,
+		response: Dictionary) -> void:
+	var now := Time.get_ticks_msec()
+	if now < _next_request_failure_report_msec:
+		return
+	_next_request_failure_report_msec = now + 5000
+	var resource_id := resource_url.split("?", true, 1)[0].sha256_text().substr(0, 12)
+	var status := int(response.get("status", 0))
+	var reason := "HTTP %d" % status if status > 0 else "transport error"
+	_post_info({"error": "GWTiles3DStreamer: %s request failed (%s, resource %s); check network access and Cesium ion credentials/session."
+			% [resource_kind, reason, resource_id]})
 
 ## Returns {"ok": bool, "tileset_url": String, "auth_query": String,
 ## "attributions": Array, "is_google": bool} -- same two response shapes
@@ -623,9 +894,8 @@ func _ensure_param(params: Array, param: String) -> Array:
 	result.append(param)
 	return result
 
-
 ## allow_session=false excludes the "session" param specifically -- see
-## _walk_tileset's use of this: the top-level tileset root endpoint (unlike
+## _walk_tileset_live's use of this: the top-level tileset root endpoint (unlike
 ## every dataset-specific path under it) rejects a session param outright
 ## (verified live: HTTP 400 "Unknown name 'session': Cannot bind query
 ## parameter"), which only bites once a session has actually been captured
@@ -671,164 +941,305 @@ func _find_session_token(tile: Dictionary) -> String:
 	return ""
 
 
-func _walk_tileset(tileset_url: String, base_transform: Transform3D, aoi_bbox: Array, aoi_center: Vector3,
-		aoi_radius: float, anchor_lat: float, anchor_lon: float, anchor_alt: float,
-		detail_m_threshold: float, exclude_radius_m: float,
-		known_ids: PackedStringArray, found_ids: Dictionary, new_tiles: Array, visited: Dictionary, stats: Dictionary) -> void:
-	if visited.has(tileset_url):
-		return  # avoid infinite loops on a malformed/self-referential tileset
-	visited[tileset_url] = true
-	# See _apply_auth's doc comment: the top-level root endpoint specifically
-	# must never carry a session param, even once one has been captured from
-	# an earlier poll's traversal.
-	var is_root := tileset_url.split("?", true, 1)[0] == _tileset_root_url.split("?", true, 1)[0]
-	var resp := _http_get(_apply_auth(tileset_url, not is_root))
-	if not resp["ok"]:
-		stats["http_errors"] += 1
-		return  # network hiccup -- skip this branch this pass, next wake retries
-	var parsed = JSON.parse_string((resp["body"] as PackedByteArray).get_string_from_utf8())
-	if not (parsed is Dictionary) or not (parsed as Dictionary).has("root"):
-		stats["http_errors"] += 1
+func _run_selection(snapshot: Dictionary) -> void:
+	_selection_budget_exhausted = false
+	var desired := {}
+	var active_documents := {}
+	var transitions := []
+	# Admit the complete coarse frontier before spending slots on detail.
+	# Planning never queues GLB payloads, so a full payload queue cannot block
+	# the control decision that releases obsolete residency.
+	var coarse := _walk_tileset_live(_tileset_root_url, Transform3D.IDENTITY, snapshot,
+			desired, active_documents, "", max_tiles_loaded, false, false, transitions)
+	if not coarse["ok"] or not coarse["complete"] or not _thread_running():
 		return
-	var doc: Dictionary = parsed
-	var root: Dictionary = doc["root"]
-	var session_token := _find_session_token(root)
-	if session_token != "":
-		_auth_params = _ensure_param(_auth_params, "session=%s" % session_token)
-	_walk_tile(root, base_transform, tileset_url, aoi_bbox, aoi_center, aoi_radius,
-			anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
+	var sent := {}
+	for id in snapshot["known_ids"]:
+		sent[String(id)] = true
+	_publish_selection(snapshot, desired, transitions, 0)
+	_download_selection(desired, snapshot, sent)
+	active_documents.clear()
+	var detailed := _walk_tileset_live(_tileset_root_url, Transform3D.IDENTITY, snapshot,
+			desired, active_documents, "", max_tiles_loaded, true, false, transitions)
+	if detailed["ok"] and detailed["complete"] and _thread_running():
+		_publish_selection(snapshot, desired, transitions, 1)
+		_download_selection(desired, snapshot, sent)
 
 
-func _walk_tile(tile: Dictionary, parent_transform: Transform3D, base_url: String, aoi_bbox: Array,
-		aoi_center: Vector3, aoi_radius: float, anchor_lat: float, anchor_lon: float, anchor_alt: float,
-		detail_m_threshold: float, exclude_radius_m: float,
-		known_ids: PackedStringArray, found_ids: Dictionary, new_tiles: Array, visited: Dictionary, stats: Dictionary) -> void:
-	stats["visited"] += 1
-	var result := GWTiles3DTraversal.evaluate_tile(tile, parent_transform, detail_m_threshold, aoi_bbox, aoi_center, aoi_radius)
-	match result["action"]:
-		"content":
-			var bv: Dictionary = tile.get("boundingVolume", {})
-			for content in result["contents"]:
-				_handle_content(content, result["transform"], bv, base_url, aoi_bbox, aoi_center, aoi_radius,
-						anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
-		"recurse":
-			for entry in result["children"]:
-				_walk_tile(entry["tile"], entry["transform"], base_url, aoi_bbox, aoi_center, aoi_radius,
-						anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
-		"prune":
-			stats["pruned"] += 1
-		# "none": nothing to do
-
-
-func _handle_content(content: Dictionary, transform: Transform3D, bv: Dictionary, base_url: String,
-		aoi_bbox: Array, aoi_center: Vector3, aoi_radius: float,
-		anchor_lat: float, anchor_lon: float, anchor_alt: float,
-		detail_m_threshold: float, exclude_radius_m: float,
-		known_ids: PackedStringArray, found_ids: Dictionary, new_tiles: Array, visited: Dictionary, stats: Dictionary) -> void:
-	var uri: String = content.get("uri", content.get("url", ""))
-	if uri == "":
-		return
-	var content_url := _resolve_relative_url(base_url, uri)
-	var stripped := content_url.split("?", true, 1)[0]
-
-	if stripped.ends_with(".json"):
-		# External tileset reference -- recurse into it with the transform
-		# accumulated so far as its new base. Same AOI (it's anchor-derived,
-		# not tileset-derived).
-		_walk_tileset(content_url, transform, aoi_bbox, aoi_center, aoi_radius,
-				anchor_lat, anchor_lon, anchor_alt, detail_m_threshold, exclude_radius_m, known_ids, found_ids, new_tiles, visited, stats)
-		return
-
-	var approx_ecef_for_exclusion := _approx_tile_center_ecef(bv, transform)
-	if exclude_radius_m > 0.0 and (approx_ecef_for_exclusion - aoi_center).length() < exclude_radius_m:
-		# The far/coarse ring's tile falls within the near ring's radius,
-		# which already covers it at better detail -- skip it here so the
-		# two rings never place overlapping/z-fighting content for the same
-		# real-world area.
-		stats["excluded"] += 1
-		return
-
-	# A stable spatial hash of the tile's real-world position, NOT the
-	# content URL -- found live: Google mints a fresh, unique opaque path
-	# segment (not just a query token) for the SAME real-world tile on every
-	# separate tileset.json fetch, apparently tied to its ephemeral session.
-	# Keying identity on that URL meant every poll saw "all new" content and
-	# kept re-adding duplicates of tiles it already had (three identical
-	# stationary polls produced 3x the tile count instead of the same one).
-	# The bounding-volume-derived position is real, stable geographic data
-	# and costs nothing extra to compute (already needed for approx_position;
-	# reused from the exclusion check above rather than recomputed).
-	var approx_ecef := approx_ecef_for_exclusion
-	var stable_id := _stable_tile_id(approx_ecef)
-
-	if found_ids.has(stable_id):
-		return  # already handled this pass (a tile can be reachable via multiple paths)
-	found_ids[stable_id] = true
-	if known_ids.has(stable_id):
-		stats["downloaded"] += 1  # already loaded, but still "in range" -- counts toward a non-zero pass
-		return  # already loaded by the main thread -- nothing to fetch
-
-	var resp := _http_get(_apply_auth(content_url))
-	if not resp["ok"]:
-		stats["http_errors"] += 1
-		return
-	var data: PackedByteArray = GWTiles3DTraversal.unwrap_b3dm(resp["body"])
-	if data.size() < 4 or data.slice(0, 4).get_string_from_ascii() != "glTF":
-		return  # not a glb/b3dm we handle (e.g. .pnts/.i3dm) -- v1 targets mesh content only
-
-	stats["downloaded"] += 1
-	new_tiles.append({
-		"id": stable_id,
-		"bytes": data,
-		"wrapper_transform": GWTiles3DTraversal.local_transform_to_godot(transform, anchor_lat, anchor_lon, anchor_alt),
-		"ecef_transform": transform,
-		"content_axis_correction": "google_yup_ecef" if _is_google else "",
-		# Rough placement-priority position, NOT the real final position (that
-		# only exists after parsing the content, see place_tile) -- from the
-		# tile's OWN boundingVolume, which is real ECEF-ish data available
-		# before downloading anything. Needed because wrapper_transform alone
-		# is useless for this: for Google tiles it's identical (~Earth-center-
-		# relative) for every tile in a pass, since the real per-tile offset
-		# lives entirely inside each tile's own content, not the tileset
-		# chain -- found live, sorting by wrapper_transform.origin was a
-		# silent no-op (every tile tied on the same key).
-		"approx_position": GWGeodeticConvert.ecef_xyz_to_godot_position(
-				approx_ecef.x, approx_ecef.y, approx_ecef.z, anchor_lat, anchor_lon, anchor_alt),
-		# The same centre, anchor-independent: approx_position above is relative
-		# to whatever anchor was current at fetch time, so it goes stale on a
-		# reanchor. Keeping the raw ECEF lets a tile's real position be
-		# recomputed against the CURRENT anchor whenever it is needed.
-		"approx_ecef": approx_ecef,
+func _publish_selection(snapshot: Dictionary, desired: Dictionary,
+		transitions: Array, phase: int) -> void:
+	_post_plan({
+		"kind": "plan", "phase": phase,
+		"desired_ids": PackedStringArray(desired.keys()),
+		"transitions": transitions.duplicate(true),
+		"generation": snapshot["generation"],
+		"view_revision": snapshot["view_revision"],
 	})
 
 
-## Best-effort tile center from its boundingVolume, in world ECEF -- see
-## approx_position's doc comment above for why this (not wrapper_transform)
-## is the right thing to sort placement priority by.
-func _approx_tile_center_ecef(bv: Dictionary, transform: Transform3D) -> Vector3:
-	if bv.has("box"):
-		var box: Array = bv["box"]
-		return transform * Vector3(box[0], box[1], box[2])
-	if bv.has("sphere"):
-		var sph: Array = bv["sphere"]
-		return transform * Vector3(sph[0], sph[1], sph[2])
-	if bv.has("region"):
-		var region: Array = bv["region"]
-		var mid_lon := rad_to_deg((float(region[0]) + float(region[2])) * 0.5)
-		var mid_lat := rad_to_deg((float(region[1]) + float(region[3])) * 0.5)
-		var mid_alt := (float(region[4]) + float(region[5])) * 0.5
-		return GWGeodeticConvert.geodetic_to_ecef(mid_lat, mid_lon, mid_alt)  # region is already geodetic/global, not local to transform
-	return transform.origin  # unknown volume type -- fall back to whatever we have
+func _download_selection(desired: Dictionary, snapshot: Dictionary, sent: Dictionary) -> void:
+	var attempted := 0
+	# Preserve provider order within each class while admitting local safety and
+	# collision coverage before payloads needed only by a distant camera view.
+	for priority in 2:
+		for id in desired:
+			if sent.has(id):
+				continue
+			var request: Dictionary = desired[id]
+			if _bounds_intersect_local(request["bounds"], snapshot) != (priority == 0):
+				continue
+			# Yield at backpressure; the admitted plan is already independently
+			# available to the main thread. A later snapshot resumes missing data.
+			_mutex.lock()
+			var full := _pending_results.size() >= MAX_PENDING_RESULTS
+			var superseded := _target_change_revision > int(snapshot["view_revision"])
+			_mutex.unlock()
+			if full or (superseded and attempted >= 4) or not _thread_running():
+				return
+			if _fetch_content(request["url"], id, request["transform"],
+					request["bounding_volume"], request["bounds"],
+					request["pending_parent"], snapshot):
+				sent[id] = true
+			attempted += 1
 
 
-## A stable identity for "this real-world tile" from its approximate ECEF
-## center, coarse enough (10m grid) to be stable across separate fetches of
-## the same tile (its bounding volume center should match to well under
-## that between fetches) while still distinguishing genuinely different
-## nearby tiles at this asset's typical tile spacing.
-static func _stable_tile_id(ecef_center: Vector3) -> String:
-	const GRID := 10.0
-	return "%d,%d,%d" % [roundi(ecef_center.x / GRID), roundi(ecef_center.y / GRID), roundi(ecef_center.z / GRID)]
+func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapshot: Dictionary,
+		desired: Dictionary, active_documents: Dictionary, pending_parent: String, budget: int,
+		refine_enabled: bool, force_coverage: bool, transitions: Array) -> Dictionary:
+	# URI-only ancestry rejects transformed cycles; erasing on return still
+	# permits sequential sibling instances of the same external document.
+	var document_uri := _canonical_content_uri(tileset_url)
+	if active_documents.has(document_uri):
+		return {"ok": false, "complete": false, "coverage": PackedStringArray()}
+	active_documents[document_uri] = true
+	var is_root := document_uri == _canonical_content_uri(_tileset_root_url)
+	# Each document can mint its own session. Cache by the effective request,
+	# and restore the parent's context after descending into an external set.
+	var request_url := _apply_auth(tileset_url, not is_root)
+	var cache_key := request_url.sha256_text()
+	var doc = _document_cache.get(cache_key)
+	if doc == null:
+		var resp := _http_get(request_url)
+		if not resp["ok"]:
+			if int(resp.get("status", 0)) in [400, 401, 403]:
+				_document_cache.clear()
+			if _thread_running():
+				_report_request_failure("external tileset metadata", tileset_url, resp)
+			active_documents.erase(document_uri)
+			return {"ok": false, "complete": false, "coverage": PackedStringArray()}
+		doc = JSON.parse_string((resp["body"] as PackedByteArray).get_string_from_utf8())
+		if not (doc is Dictionary) or not doc.has("root"):
+			active_documents.erase(document_uri)
+			return {"ok": false, "complete": false, "coverage": PackedStringArray()}
+	var parent_auth := _auth_params
+	var token := _find_session_token(doc["root"])
+	if token != "":
+		_auth_params = _ensure_param(_auth_params, "session=%s" % token)
+	if not _document_cache.has(cache_key):
+		if _document_cache.size() >= MAX_TILESET_DOCUMENTS:
+			_document_cache.erase(_document_cache.keys()[0])
+		_document_cache[cache_key] = doc
+	var result := _walk_tile_live(doc["root"], base_transform, tileset_url, snapshot, desired,
+			active_documents, pending_parent, budget, "REPLACE", refine_enabled,
+			force_coverage, transitions)
+	_auth_params = parent_auth
+	active_documents.erase(document_uri)
+	return result
+
+
+func _walk_tile_live(tile: Dictionary, parent_transform: Transform3D, base_url: String,
+		snapshot: Dictionary, desired: Dictionary, active_documents: Dictionary,
+		pending_parent: String, budget: int, inherited_refine: String,
+		refine_enabled: bool, force_coverage: bool, transitions: Array) -> Dictionary:
+	if not _thread_running():
+		return {"ok": false, "complete": false, "coverage": PackedStringArray()}
+	var transform := parent_transform
+	if tile.has("transform"):
+		transform = parent_transform * GWTiles3DTraversal.parse_gltf_transform(tile["transform"])
+	var bounds := GWTiles3DTraversal.bounding_sphere(tile.get("boundingVolume", {}), transform,
+			snapshot["anchor_lat"], snapshot["anchor_lon"], snapshot["anchor_alt"])
+	var local_needed := _bounds_intersect_local(bounds, snapshot)
+	var visible := false
+	for view in snapshot["views"]:
+		var camera_distance := maxf((bounds["center"] as Vector3).distance_to(
+				view["position"]) - float(bounds["radius"]), 0.0)
+		if camera_distance <= float(snapshot["far_radius"]) \
+				and GWTiles3DTraversal.bounds_visible(bounds, view):
+			visible = true
+			break
+	if not force_coverage and not local_needed and not visible:
+		return {"ok": true, "complete": true, "coverage": PackedStringArray()}
+
+	var refine := String(tile.get("refine", inherited_refine)).to_upper()
+	if refine != "ADD":
+		refine = "REPLACE"
+	var contents := _tile_contents(tile)
+	var own_ids := PackedStringArray()
+	for index in contents.size():
+		var content: Dictionary = contents[index]
+		var uri := String(content.get("uri", content.get("url", "")))
+		if uri == "":
+			continue
+		var content_url := _resolve_relative_url(base_url, uri)
+		if _canonical_content_uri(content_url).split("?", true, 1)[0].ends_with(".json"):
+			var nested := _walk_tileset_live(content_url, transform, snapshot, desired,
+					active_documents, pending_parent, budget, refine_enabled,
+					force_coverage, transitions)
+			if not nested["ok"] or not nested["complete"]:
+				return nested
+			own_ids.append_array(nested["coverage"])
+			continue
+		var id := _stable_tile_id(content_url, transform, index)
+		if not desired.has(id) and desired.size() >= budget:
+			_selection_budget_exhausted = true
+			return {"ok": true, "complete": false, "coverage": own_ids}
+		desired[id] = {
+			"url": _apply_auth(content_url), "transform": transform,
+			"bounding_volume": tile.get("boundingVolume", {}),
+			"bounds": bounds, "pending_parent": pending_parent,
+		}
+		own_ids.append(id)
+
+	var children: Array = tile.get("children", [])
+	var sse := GWTiles3DTraversal.screen_space_error(
+			float(tile.get("geometricError", 0.0)), bounds, snapshot["views"])
+	var should_refine := refine_enabled and not _selection_budget_exhausted and visible \
+			and sse > float(snapshot["maximum_sse"]) and not children.is_empty()
+	if not should_refine:
+		if not own_ids.is_empty():
+			return {"ok": true, "complete": true, "coverage": own_ids}
+		if children.is_empty():
+			return {"ok": true, "complete": true, "coverage": PackedStringArray()}
+		# A contentless intermediary is not geographical coverage; descend to
+		# the first real frontier even when this branch is only a coarse sibling.
+
+	var group_id := String(own_ids[0]) if not own_ids.is_empty() else pending_parent
+	var child_pending := group_id if refine == "REPLACE" and group_id != "" else pending_parent
+	var child_force := force_coverage or (refine == "REPLACE" and not own_ids.is_empty())
+	var child_coverage := PackedStringArray()
+	var child_start := desired.size()
+	var transition_start := transitions.size()
+	# First obtain every sibling's coarse coverage. Only then may any visible
+	# sibling consume the remaining budget with deeper refinement.
+	for child in children:
+		var result := _walk_tile_live(child, transform, base_url, snapshot, desired,
+				active_documents, child_pending, budget, refine, false,
+				child_force, transitions)
+		if not result["ok"] or not result["complete"]:
+			if not own_ids.is_empty():
+				_rollback_refinement(desired, child_start, transitions, transition_start)
+				return {"ok": true, "complete": true, "coverage": own_ids}
+			return {"ok": result["ok"], "complete": false, "coverage": child_coverage}
+		child_coverage.append_array(result["coverage"])
+	if should_refine:
+		# Spend a bounded detail budget on the largest projected errors first.
+		var order := range(children.size())
+		var priorities := PackedFloat64Array()
+		priorities.resize(children.size())
+		for index in order:
+			var child: Dictionary = children[index]
+			var child_transform := transform
+			if child.has("transform"):
+				child_transform = transform * GWTiles3DTraversal.parse_gltf_transform(child["transform"])
+			var child_bounds := GWTiles3DTraversal.bounding_sphere(
+					child.get("boundingVolume", {}), child_transform,
+					snapshot["anchor_lat"], snapshot["anchor_lon"], snapshot["anchor_alt"])
+			priorities[index] = GWTiles3DTraversal.screen_space_error(
+					float(child.get("geometricError", 0.0)), child_bounds, snapshot["views"])
+		order.sort_custom(func(a: int, b: int) -> bool: return priorities[a] > priorities[b])
+		for index in order:
+			if _selection_budget_exhausted:
+				break
+			var child: Dictionary = children[index]
+			var refinement_start := desired.size()
+			var refinement_transitions := transitions.size()
+			var result := _walk_tile_live(child, transform, base_url, snapshot, desired,
+					active_documents, child_pending, budget, refine, true,
+					child_force, transitions)
+			if not result["ok"] or not result["complete"]:
+				_rollback_refinement(desired, refinement_start, transitions, refinement_transitions)
+
+	if refine == "REPLACE" and not own_ids.is_empty() and not child_coverage.is_empty():
+		transitions.append({
+			"parent_ids": own_ids,
+			"required_ids": child_coverage,
+			"fallback_parent": pending_parent,
+		})
+		# Ancestors replace this tile as one geographical unit, not with its
+		# currently visible descendants. This keeps relations view-independent.
+		return {"ok": true, "complete": true, "coverage": own_ids}
+	if refine == "ADD":
+		own_ids.append_array(child_coverage)
+		return {"ok": true, "complete": true, "coverage": own_ids}
+	return {"ok": true, "complete": true, "coverage": child_coverage}
+
+
+
+static func _bounds_intersect_local(bounds: Dictionary, snapshot: Dictionary) -> bool:
+	var delta: Vector3 = (bounds["center"] as Vector3) - (snapshot["local_center"] as Vector3)
+	var reach := float(snapshot["local_radius"]) + float(bounds["radius"])
+	return delta.x * delta.x + delta.z * delta.z <= reach * reach
+
+static func _rollback_refinement(desired: Dictionary, keep_count: int,
+		transitions: Array, keep_transitions: int) -> void:
+	var ids := desired.keys()
+	for index in range(keep_count, ids.size()):
+		desired.erase(ids[index])
+	transitions.resize(keep_transitions)
+
+
+func _tile_contents(tile: Dictionary) -> Array:
+	if tile.has("contents") and tile["contents"] is Array:
+		return tile["contents"]
+	if tile.has("content") and tile["content"] is Dictionary:
+		return [tile["content"]]
+	return []
+
+
+func _fetch_content(content_url: String, id: String, transform: Transform3D,
+		bounding_volume: Dictionary, bounds: Dictionary, pending_parent: String,
+		snapshot: Dictionary) -> bool:
+	if not _thread_running():
+		return false
+	var resp := _http_get(_apply_auth(content_url))
+	if not resp["ok"]:
+		if int(resp.get("status", 0)) in [400, 401, 403]:
+			_document_cache.clear()
+		if _thread_running():
+			_report_request_failure("tile payload", content_url, resp)
+		return false
+	var data := GWTiles3DTraversal.unwrap_b3dm(resp["body"])
+	if data.size() < 4 or data.slice(0, 4).get_string_from_ascii() != "glTF":
+		return false
+	return _post_result({
+		"kind": "tile", "id": id, "bytes": data, "ecef_transform": transform,
+		"bounds": bounds.duplicate(true),
+		"bounding_volume": bounding_volume.duplicate(true),
+		"pending_parent": pending_parent,
+		"generation": snapshot["generation"], "view_revision": snapshot["view_revision"],
+	})
+
+
+## Identity is anchor-independent and includes the canonical source content
+## URI plus its complete tileset-instance transform. Ephemeral credentials are
+## stripped before the URI enters scene state, logs, node names, or tests.
+static func _stable_tile_id(content_uri: String, transform: Transform3D,
+		content_index: int = 0) -> String:
+	var identity := _canonical_content_uri(content_uri) + "|" \
+			+ var_to_bytes(transform).hex_encode() + "|" + str(content_index)
+	return "tile:" + identity.sha256_text()
+
+
+static func _canonical_content_uri(uri: String) -> String:
+	var pieces := uri.split("?", true, 1)
+	if pieces.size() == 1:
+		return uri
+	var safe_params := PackedStringArray()
+	for pair in String(pieces[1]).split("&"):
+		var name := String(pair).split("=", true, 1)[0].to_lower()
+		if name not in ["access_token", "key", "session", "token"]:
+			safe_params.append(pair)
+	return String(pieces[0]) + (("?" + "&".join(safe_params)) if not safe_params.is_empty() else "")
 
 
 ## uri may be a full URL, an absolute path ("/v1/..."), or a path relative
@@ -866,7 +1277,7 @@ var _http_clients: Dictionary = {}  ## thread-local only: "host:port" -> HTTPCli
 func _http_get(url: String, _retried: bool = false) -> Dictionary:
 	var parsed := _parse_url(url)
 	if parsed.is_empty():
-		return {"ok": false, "error": "could not parse URL: %s" % url}
+		return {"ok": false, "error": "could not parse content URL"}
 	var key: String = "%s:%d" % [parsed["host"], parsed["port"]]
 
 	var client: HTTPClient = _http_clients.get(key)
@@ -875,9 +1286,11 @@ func _http_get(url: String, _retried: bool = false) -> Dictionary:
 		var err := client.connect_to_host(parsed["host"], parsed["port"], TLSOptions.client())
 		if err != OK:
 			return {"ok": false, "error": "connect_to_host failed: %d" % err}
-		while client.get_status() == HTTPClient.STATUS_CONNECTING or client.get_status() == HTTPClient.STATUS_RESOLVING:
+		while (client.get_status() == HTTPClient.STATUS_CONNECTING or client.get_status() == HTTPClient.STATUS_RESOLVING) and _thread_running():
 			client.poll()
 			OS.delay_msec(1)
+		if not _thread_running():
+			return {"ok": false, "error": "shutdown"}
 		if client.get_status() != HTTPClient.STATUS_CONNECTED:
 			return {"ok": false, "error": "connection failed, status %d" % client.get_status()}
 		_http_clients[key] = client
@@ -888,9 +1301,11 @@ func _http_get(url: String, _retried: bool = false) -> Dictionary:
 		if not _retried:
 			return _http_get(url, true)  # a reused connection can go stale server-side -- retry once, fresh
 		return {"ok": false, "error": "request() failed: %d" % err}
-	while client.get_status() == HTTPClient.STATUS_REQUESTING:
+	while client.get_status() == HTTPClient.STATUS_REQUESTING and _thread_running():
 		client.poll()
 		OS.delay_msec(1)
+	if not _thread_running():
+		return {"ok": false, "error": "shutdown"}
 
 	var status := client.get_status()
 	if status != HTTPClient.STATUS_BODY and status != HTTPClient.STATUS_CONNECTED:
@@ -900,13 +1315,15 @@ func _http_get(url: String, _retried: bool = false) -> Dictionary:
 		return {"ok": false, "error": "bad response status %d" % status}
 	var code := client.get_response_code()
 	var body := PackedByteArray()
-	while client.get_status() == HTTPClient.STATUS_BODY:
+	while client.get_status() == HTTPClient.STATUS_BODY and _thread_running():
 		client.poll()
 		var chunk := client.read_response_body_chunk()
 		if chunk.size() == 0:
 			OS.delay_msec(1)
 		else:
 			body.append_array(chunk)
+	if not _thread_running():
+		return {"ok": false, "error": "shutdown"}
 	return {"ok": code >= 200 and code < 300, "status": code, "body": body}
 
 
