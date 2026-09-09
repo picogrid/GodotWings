@@ -680,9 +680,11 @@ func _evict_tile(id: String) -> void:
 		_replacement_groups.erase(group_id)
 
 
-## Public collision filter. Unknown bounds conservatively return true. The
-## wrapper's visibility remains the authoritative active-coverage signal.
-func is_tile_near(tile: Node3D, world_position: Vector3, radius_m: float) -> bool:
+## Public horizontal collision filter. Collision interests are vertical terrain
+## probe columns, so altitude does not affect proximity. Unknown bounds
+## conservatively return true. The wrapper's visibility remains the
+## authoritative active-coverage signal.
+func is_tile_near_horizontal(tile: Node3D, world_position: Vector3, radius_m: float) -> bool:
 	if not is_instance_valid(tile):
 		return false
 	var entry = _wrapper_entries.get(tile.get_instance_id())
@@ -692,7 +694,8 @@ func is_tile_near(tile: Node3D, world_position: Vector3, radius_m: float) -> boo
 	if not is_finite(float(bounds.get("radius", INF))):
 		return true
 	var center_world := global_transform * (bounds["center"] as Vector3)
-	return center_world.distance_to(world_position) <= radius_m + float(bounds["radius"])
+	return Vector2(center_world.x, center_world.z).distance_to(
+			Vector2(world_position.x, world_position.z)) <= radius_m + float(bounds["radius"])
 
 
 # -----------------------------------------------------------------------------
