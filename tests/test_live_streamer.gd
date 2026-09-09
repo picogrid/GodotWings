@@ -1135,7 +1135,53 @@ func _run() -> void:
 	_test_camera_offsets_are_snapshotted()
 	_test_payload_scheduler_yields_only_to_real_target_changes()
 	_test_view_jitter_is_not_a_new_target()
+	_test_worker_threads_release_their_connections()
 	_test_coarse_pass_refines_to_coarse_sse()
 
 	print("\ntest_live_streamer: ", "PASS" if _ok else "FAIL")
 	quit(0 if _ok else 1)
+
+
+## Payload workers are created per batch, so a connection left in a dead
+## thread's pool holds its socket for the life of the node. Six workers a poll
+## at four polls a second exhausted the process's file descriptors in minutes
+## ("_sock == -1" on every later connect), so this pins the release down.
+func _test_worker_threads_release_their_connections() -> void:
+	var streamer := _new_streamer(_document(_content_tile("pool.glb", _anchor_ecef)))
+	_check(streamer.open_connection_count() == 0, "a fresh streamer holds no connections")
+
+	# What a worker does: take this thread's pool, put a connection in it, and
+	# release it on the way out.
+	var release_worker := func() -> void:
+		streamer._thread_http_clients()["synthetic.test:443"] = HTTPClient.new()
+		streamer._release_thread_http_clients()
+	var threads: Array[Thread] = []
+	for _i in 6:
+		var thread := Thread.new()
+		thread.start(release_worker)
+		threads.append(thread)
+	for thread in threads:
+		thread.wait_to_finish()
+	_check(streamer.open_connection_count() == 0,
+			"six worker generations leave no connections behind (%d)" % streamer.open_connection_count())
+
+	# The same workers without the release: exactly the leak, so the check above
+	# is known to be able to fail.
+	var leaky_worker := func() -> void:
+		streamer._thread_http_clients()["synthetic.test:443"] = HTTPClient.new()
+	threads.clear()
+	for _i in 3:
+		var thread := Thread.new()
+		thread.start(leaky_worker)
+		threads.append(thread)
+	for thread in threads:
+		thread.wait_to_finish()
+	_check(streamer.open_connection_count() == 3,
+			"a worker that does not release is what leaks (%d)" % streamer.open_connection_count())
+	# And a real multi-worker download batch must not accumulate any.
+	streamer._http_clients_by_thread.clear()
+	streamer.download_workers = 4
+	_serve_content(streamer, ["pool.glb"])
+	_run_and_drain(streamer, 1, [_view(Vector3.FORWARD)])
+	_check(streamer.open_connection_count() == 0,
+			"a finished download batch holds no connections (%d)" % streamer.open_connection_count())

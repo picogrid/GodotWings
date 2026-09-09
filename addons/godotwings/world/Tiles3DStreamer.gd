@@ -852,6 +852,7 @@ func _stream_loop() -> void:
 			if not newer:
 				break
 	_join_downloads()
+	_release_thread_http_clients()
 
 
 func _thread_running() -> bool:
@@ -1158,6 +1159,18 @@ func _join_downloads() -> void:
 func _download_worker(batch: Array[String], cursor: Array, stopped: Array,
 		desired: Dictionary, snapshot: Dictionary, sent: Dictionary, attempted: Array,
 		yield_to_newer: bool) -> void:
+	_download_worker_loop(batch, cursor, stopped, desired, snapshot, sent, attempted, yield_to_newer)
+	# A worker is created per batch, so its connections must go with it: an
+	# HTTPClient left in the pool of a dead thread holds its socket for the
+	# life of the node. Found live -- six workers a poll, four polls a second,
+	# and the process ran out of file descriptors in minutes ("_sock == -1"
+	# from every subsequent connect).
+	_release_thread_http_clients()
+
+
+func _download_worker_loop(batch: Array[String], cursor: Array, stopped: Array,
+		desired: Dictionary, snapshot: Dictionary, sent: Dictionary, attempted: Array,
+		yield_to_newer: bool) -> void:
 	while true:
 		_mutex.lock()
 		var index: int = cursor[0]
@@ -1434,6 +1447,11 @@ func _prefetch_child_documents(children: Array, base_url: String) -> void:
 
 
 func _prefetch_worker(pending: Array, cursor: Array, results: Array) -> void:
+	_prefetch_worker_loop(pending, cursor, results)
+	_release_thread_http_clients()
+
+
+func _prefetch_worker_loop(pending: Array, cursor: Array, results: Array) -> void:
 	while _thread_running():
 		_mutex.lock()
 		var index: int = cursor[0]
@@ -1555,6 +1573,30 @@ func _thread_http_clients() -> Dictionary:
 	return clients
 
 
+## Close and forget the calling thread's connections. Every short-lived worker
+## must call this before it exits; the long-lived streaming thread keeps its
+## pool for the life of the node and releases it in _exit_tree.
+func _release_thread_http_clients() -> void:
+	var thread_id := OS.get_thread_caller_id()
+	_http_pool_mutex.lock()
+	var clients: Dictionary = _http_clients_by_thread.get(thread_id, {})
+	_http_clients_by_thread.erase(thread_id)
+	_http_pool_mutex.unlock()
+	for client in clients.values():
+		(client as HTTPClient).close()
+
+
+## Live connections held across every thread's pool -- for the tests, and a
+## cheap way to see a leak.
+func open_connection_count() -> int:
+	var total := 0
+	_http_pool_mutex.lock()
+	for clients in _http_clients_by_thread.values():
+		total += (clients as Dictionary).size()
+	_http_pool_mutex.unlock()
+	return total
+
+
 ## Blocking GET via Godot's low-level HTTPClient -- fine to call from a
 ## background thread (mirrors GWSITLBridge's blocking-socket-in-a-thread
 ## pattern). Reuses one HTTPClient (and its TLS session) per host across the
@@ -1576,18 +1618,23 @@ func _http_get(url: String, _retried: bool = false) -> Dictionary:
 		client = HTTPClient.new()
 		var err := client.connect_to_host(parsed["host"], parsed["port"], TLSOptions.client())
 		if err != OK:
+			client.close()
 			return {"ok": false, "error": "connect_to_host failed: %d" % err}
 		while (client.get_status() == HTTPClient.STATUS_CONNECTING or client.get_status() == HTTPClient.STATUS_RESOLVING) and _thread_running():
 			client.poll()
 			OS.delay_msec(1)
 		if not _thread_running():
+			client.close()
 			return {"ok": false, "error": "shutdown"}
 		if client.get_status() != HTTPClient.STATUS_CONNECTED:
-			return {"ok": false, "error": "connection failed, status %d" % client.get_status()}
+			var status_before := client.get_status()
+			client.close()
+			return {"ok": false, "error": "connection failed, status %d" % status_before}
 		_http_clients[key] = client
 
 	var err := client.request(HTTPClient.METHOD_GET, parsed["path"], PackedStringArray(["User-Agent: GodotWings-Tiles3DStreamer"]))
 	if err != OK:
+		client.close()
 		_http_clients.erase(key)
 		if not _retried:
 			return _http_get(url, true)  # a reused connection can go stale server-side -- retry once, fresh
@@ -1600,6 +1647,7 @@ func _http_get(url: String, _retried: bool = false) -> Dictionary:
 
 	var status := client.get_status()
 	if status != HTTPClient.STATUS_BODY and status != HTTPClient.STATUS_CONNECTED:
+		client.close()
 		_http_clients.erase(key)
 		if not _retried:
 			return _http_get(url, true)
