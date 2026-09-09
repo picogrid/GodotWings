@@ -560,18 +560,22 @@ func _test_failed_payloads_preserve_nested_fallbacks() -> void:
 		_content_tile("deep-a.glb", _anchor_ecef),
 		_content_tile("deep-b.glb", _anchor_ecef),
 	])
-	var root_tile := _content_tile("outer.glb", _anchor_ecef, 100.0, [
-		_content_tile("failure-nested.json", _anchor_ecef),
-	])
-	var streamer := _new_streamer(_document(root_tile), 4, 4)
+	var root_tile := {
+		"boundingVolume": _sphere(_anchor_ecef),
+		"geometricError": 100.0,
+		"contents": [{"uri": "outer-missing.glb"}, {"uri": "outer.glb"}],
+		"children": [_content_tile("failure-nested.json", _anchor_ecef)],
+	}
+	var streamer := _new_streamer(_document(root_tile), 5, 4)
 	streamer.responses["https://synthetic.test/failure-nested.json"] = _document(nested_root)
+	streamer.responses["https://synthetic.test/outer-missing.glb"] = "not a glTF".to_utf8_buffer()
 	streamer.responses["https://synthetic.test/outer.glb"] = GLTF_SENTINEL
 	streamer.responses["https://synthetic.test/middle.glb"] = "not a glTF".to_utf8_buffer()
 	streamer.responses["https://synthetic.test/deep-a.glb"] = GLTF_SENTINEL
 	streamer.responses["https://synthetic.test/deep-b.glb"] = GLTF_SENTINEL
 	_run_and_drain(streamer, 1, [_view(Vector3.FORWARD)])
 
-	var outer := _id("outer.glb")
+	var outer := _id("outer.glb", 1)
 	var middle := _id("middle.glb")
 	var deep_a := _id("deep-a.glb")
 	var deep_b := _id("deep-b.glb")
@@ -643,6 +647,46 @@ func _test_failed_root_payload_promotes_complete_children() -> void:
 			and not streamer._loaded_tiles.has(leaf_a)
 			and not streamer._loaded_tiles.has(leaf_b),
 			"an authoritative selection elsewhere retires rescued root children")
+
+	var nested_root := _content_tile("missing-outer.glb", _anchor_ecef, 100.0, [
+		_content_tile("missing-middle.glb", _anchor_ecef, 100.0, [
+			_content_tile("nested-leaf-a.glb", _anchor_ecef),
+			_content_tile("nested-leaf-b.glb", _anchor_ecef),
+		]),
+	])
+	var nested := _new_streamer(_document(nested_root), 4, 1)
+	nested.responses["https://synthetic.test/missing-outer.glb"] = "not a glTF".to_utf8_buffer()
+	nested.responses["https://synthetic.test/missing-middle.glb"] = "not a glTF".to_utf8_buffer()
+	_serve_content(nested, ["nested-leaf-a.glb", "nested-leaf-b.glb"])
+	nested._run_selection(_snapshot(nested, 1, [_view(Vector3.FORWARD)]))
+
+	var outer := _id("missing-outer.glb")
+	var nested_leaf_a := _id("nested-leaf-a.glb")
+	var nested_leaf_b := _id("nested-leaf-b.glb")
+	nested._drain_results()
+	_check(nested._loaded_tiles.has(nested_leaf_a)
+			and not _is_visible(nested, nested_leaf_a)
+			and not nested._loaded_tiles.has(nested_leaf_b),
+			"a partial descendant cut waits when both its root and intermediary payloads are unavailable")
+	nested._drain_results()
+	_check(_is_visible(nested, nested_leaf_a) and _is_visible(nested, nested_leaf_b)
+			and nested._has_active_coverage(outer),
+			"complete leaves become root coverage when no ancestor fallback is actually visible")
+
+	_run_and_drain(nested, 2)
+	_check(_is_visible(nested, nested_leaf_a) and _is_visible(nested, nested_leaf_b)
+			and nested._has_active_coverage(outer),
+			"coarsening to the unavailable outer root retains rescued nested coverage")
+
+	nested._document_cache.clear()
+	nested.responses[ROOT_URL] = _document(
+			_content_tile("nested-replacement-root.glb", _anchor_ecef))
+	_serve_content(nested, ["nested-replacement-root.glb"])
+	_run_and_drain(nested, 3)
+	_check(_is_visible(nested, _id("nested-replacement-root.glb"))
+			and not nested._loaded_tiles.has(nested_leaf_a)
+			and not nested._loaded_tiles.has(nested_leaf_b),
+			"an authoritative replacement retires rescued nested coverage")
 
 
 func _test_nested_sessions_are_bound_to_requests() -> void:

@@ -532,6 +532,40 @@ func _try_all_promotions() -> void:
 			_try_promote(String(group_id))
 
 
+func _fallback_chain_has_active_coverage(group: Dictionary) -> bool:
+	var fallback_id := String(group["fallback_parent"])
+	var remaining := _replacement_groups.size()
+	while fallback_id != "" and remaining > 0:
+		var fallback_group_id := String(_parent_groups.get(fallback_id, ""))
+		if fallback_group_id == "" or not _replacement_groups.has(fallback_group_id):
+			return _loaded_tiles.has(fallback_id) \
+					and _loaded_tiles[fallback_id]["wrapper"].visible
+		var fallback_group: Dictionary = _replacement_groups[fallback_group_id]
+		for parent_id in fallback_group["parent_ids"]:
+			var id := String(parent_id)
+			if _loaded_tiles.has(id) and _loaded_tiles[id]["wrapper"].visible:
+				return true
+		fallback_id = String(fallback_group["fallback_parent"])
+		remaining -= 1
+	return false
+
+
+func _fallback_chain_is_desired(group: Dictionary) -> bool:
+	var fallback_id := String(group["fallback_parent"])
+	var remaining := _replacement_groups.size()
+	while fallback_id != "" and remaining > 0:
+		var fallback_group_id := String(_parent_groups.get(fallback_id, ""))
+		if fallback_group_id == "" or not _replacement_groups.has(fallback_group_id):
+			return _current_desired_ids.has(fallback_id)
+		var fallback_group: Dictionary = _replacement_groups[fallback_group_id]
+		for parent_id in fallback_group["parent_ids"]:
+			if _current_desired_ids.has(String(parent_id)):
+				return true
+		fallback_id = String(fallback_group["fallback_parent"])
+		remaining -= 1
+	return false
+
+
 func _try_promote(group_id: String) -> bool:
 	if not _replacement_groups.has(group_id):
 		return false
@@ -544,9 +578,10 @@ func _try_promote(group_id: String) -> bool:
 			parent_missing = true
 			continue
 		was_active = was_active or _loaded_tiles[id]["wrapper"].visible
-	# Only a root cut has no coarser fallback to overlap. A missing nested
-	# parent must keep its complete descendants staged behind that ancestor.
-	if parent_missing and String(group["fallback_parent"]) != "":
+	# Missing intermediary payloads may expose a complete descendant cut only
+	# when no actual coarser wrapper is visible. Follow the authoritative
+	# fallback chain rather than inferring ancestry from unrelated groups.
+	if parent_missing and _fallback_chain_has_active_coverage(group):
 		return false
 	for child_id in group["required_ids"]:
 		if not _coverage_ready(String(child_id)):
@@ -634,7 +669,7 @@ func _apply_selection(event: Dictionary) -> void:
 		_register_transition(transition)
 
 	# Zoom-out is atomic too: restore every item of the coarse parent before
-	# hiding descendants. If a parent payload is absent, retain the old cut.
+	# hiding descendants. An unavailable desired fallback retains the old cut.
 	for group_id in _replacement_groups.keys():
 		var group: Dictionary = _replacement_groups[group_id]
 		if selected_groups.has(group_id):
@@ -647,12 +682,11 @@ func _apply_selection(event: Dictionary) -> void:
 				parents_ready = false
 				break
 		if not parents_ready:
-			var parent_still_desired := false
+			var fallback_still_desired := _fallback_chain_is_desired(group)
 			for parent_id in group["parent_ids"]:
-				parent_still_desired = parent_still_desired \
+				fallback_still_desired = fallback_still_desired \
 						or _current_desired_ids.has(String(parent_id))
-			if group["promoted"] and String(group["fallback_parent"]) == "" \
-					and not parent_still_desired:
+			if group["promoted"] and not fallback_still_desired:
 				for child_id in group["required_ids"]:
 					_hide_coverage(String(child_id))
 				group["promoted"] = false

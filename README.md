@@ -387,7 +387,9 @@ The background thread performs traversal and sequential HTTP requests. Each
 selection admits coarse coverage before refining it, and complete replacement
 groups keep their parents visible until every required child is available.
 At the root, a failed coarse payload does not block an otherwise complete child
-cut; missing intermediate parents keep their descendants staged.
+cut. Missing intermediate payloads keep descendants staged only while an
+ancestor fallback is visible; without one, complete descendants provide the
+coverage instead.
 New coarse coverage does not discard detail that is already visible. Changed
 camera targets interrupt the old payload queue after a small progress batch.
 
