@@ -240,8 +240,16 @@ func _reset_state() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if _source == null or not _source.has_command():
-		return # SITL: advance only when ArduPilot has sent PWM. MANUAL: every tick.
+	if _source == null:
+		return
+	if not _source.has_command():
+		# SITL lockstep: ArduPilot's reply lands ~RTT after post_state -- a
+		# back-to-back tick burst would miss it every time and the exchange
+		# rate collapses to one per rendered frame (sim at fps/control_rate of
+		# realtime). Wait for it inside the tick instead. MANUAL input (no
+		# wait_command) keeps the old advance-every-tick.
+		if not (_source.has_method("wait_command") and _source.wait_command()):
+			return
 	_cmd = _source.take_command()
 	_update_controls(_cmd["pwm"])
 	if _cmd["reset"]:
@@ -290,6 +298,32 @@ func launch(speed: float) -> void:
 	_airspeed = speed
 	if was_locked:
 		took_off.emit()
+
+
+## Re-seat a parked vehicle on whatever ground is under it now: re-probe the
+## terrain and rest at `spawn_altitude` above it, level, keeping the heading
+## and the simulation clock. For a host that spawns vehicles before streamed
+## terrain (Cesium tiles) has arrived and wants them on the real surface once
+## it has, rather than on the flat fallback beneath it. A no-op while airborne,
+## moving, crashed, ragdolling or held on a launcher. Returns true if it moved.
+func settle_on_ground() -> bool:
+	if _crashed or _ragdolling or _held or not _on_ground:
+		return false
+	if _vel_ned.length() > 0.2 or _omega.length() > 0.2:
+		return false
+	_update_ground_sample()
+	var target_z := _ground_down - spawn_altitude
+	if absf(target_z - _pos_ned.z) < 0.05:
+		return false
+	_pos_ned.z = target_z
+	_vel_ned = Vector3.ZERO
+	_omega = Vector3.ZERO
+	var yaw: float = GWCoordConvert.dcm_to_ned_attitude(_dcm)[2]
+	_dcm = GWCoordConvert.attitude_to_dcm(0.0, 0.0, yaw)
+	_accel_body = Vector3(0, 0, -G)
+	_reset_dynamics()
+	_sync_node()
+	return true
 
 
 ## Advance the simulation by `dt` using fixed internal sub-steps, so behaviour is

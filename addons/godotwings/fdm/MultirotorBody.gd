@@ -83,9 +83,12 @@ func _ensure_control_rate() -> void:
 		return
 	if Engine.physics_ticks_per_second < control_rate_hz:
 		Engine.physics_ticks_per_second = control_rate_hz
-		# Don't let a slow render frame starve the physics/SITL exchange.
+		# Don't let a slow render frame starve the physics/SITL exchange: with
+		# lockstep waiting (GWSITLBridge.wait_command) every allowed step
+		# completes an exchange, so this cap is the realtime floor --
+		# rate/10 keeps sim time honest down to ~10 rendered fps.
 		Engine.max_physics_steps_per_frame = maxi(
-				Engine.max_physics_steps_per_frame, ceili(control_rate_hz / 30.0))
+				Engine.max_physics_steps_per_frame, ceili(control_rate_hz / 10.0))
 		print("GWMultirotorBody: raised physics tick rate to %d Hz (copter rate loop)." % control_rate_hz)
 
 
@@ -197,7 +200,11 @@ func _update_motors(h: float, v_air_body: Vector3) -> PackedFloat32Array:
 		_spool_rate[i] = (_motor[i] - prev) / h
 		var t := pow(_motor[i], config.thrust_expo) * _per_motor_max * _var[i] * _batt_scale
 		if config.prop_pitch_speed > 0.0 and _motor[i] > 1e-3:
-			t *= clampf(1.0 - inflow / (config.prop_pitch_speed * _motor[i]), 0.0, 1.3)
+			# Upper cap 1.0, not 1.3: the windmill-brake bonus gave up to +30%
+			# free thrust while DESCENDING (~+0.25 g near hover), making
+			# throttle cuts floaty -- the quad would not drop. Washout on climb
+			# (the punch-out limiter) is unchanged.
+			t *= clampf(1.0 - inflow / (config.prop_pitch_speed * _motor[i]), 0.0, 1.0)
 		thrusts[i] = t * ge * pw_loss
 	return thrusts
 

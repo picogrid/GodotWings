@@ -36,6 +36,7 @@ var _sender_ip := ""
 var _sender_port := 0
 var _out_json := PackedByteArray()
 var _ever_connected := false
+var _last_rx_usec := 0
 
 # main-thread-only
 var _last_frame_count := -1
@@ -65,6 +66,33 @@ func has_command() -> bool:
 	var v := _has_new_cmd
 	_mutex.unlock()
 	return v
+
+
+## Bounded wait for the next command -- LOCKSTEP PACING. ArduPilot's reply to
+## the state we just posted lands ~RTT (sub-ms to ~1.5 ms through Docker) after
+## post_state(), but Godot executes a frame's physics ticks back-to-back at
+## frame start: without waiting, every tick after the first finds no command and
+## is skipped, the exchange rate collapses to ONE per rendered frame, and sim
+## time runs at render_fps / control_rate_hz of realtime (measured 0.36x at
+## 144 fps / 400 Hz, and 0.15x at 60 fps). Waiting inside the tick turns those
+## skipped ticks into exchanges; the budget stays under the 2.5 ms tick.
+## Returns immediately when SITL never connected or has gone quiet (paused,
+## killed), so an idle scene costs nothing.
+func wait_command(timeout_usec: int = 4000) -> bool:
+	if has_command():
+		return true
+	_mutex.lock()
+	var connected := _ever_connected
+	var last := _last_rx_usec
+	_mutex.unlock()
+	if not connected or Time.get_ticks_usec() - last > 500_000:
+		return false
+	var deadline := Time.get_ticks_usec() + timeout_usec
+	while Time.get_ticks_usec() < deadline:
+		OS.delay_usec(100)
+		if has_command():
+			return true
+	return false
 
 
 ## Consume the pending command. Returns a Dictionary:
@@ -118,7 +146,9 @@ func _sitl_loop() -> void:
 
 	while _running:
 		if udp.get_available_packet_count() <= 0:
-			OS.delay_msec(1)
+			# 100 us poll, not 1 ms: at 400 Hz lockstep each exchange has a
+			# 2.5 ms budget -- a 1 ms receive granularity ate ~40% of it.
+			OS.delay_usec(100)
 			continue
 
 		var packet := udp.get_packet()
@@ -135,6 +165,7 @@ func _sitl_loop() -> void:
 		_sender_ip = ip
 		_sender_port = port
 		_has_new_cmd = true
+		_last_rx_usec = Time.get_ticks_usec()
 		var first := not _ever_connected
 		_ever_connected = true
 		_mutex.unlock()
