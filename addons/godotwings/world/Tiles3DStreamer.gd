@@ -113,7 +113,27 @@ func _get_property_list() -> Array:
 @export var tiles_per_frame_budget: int = 4
 @export var lookahead_s: float = 20.0
 
+@export_group("Responsiveness")
+## Pixel error the FIRST plan of every view is built to, before the real
+## `maximum_screen_space_error` pass. Coarser tiles are few and large, so this
+## pass plans and downloads in seconds and puts real ground under the vehicle
+## while the fine pass (which can take a minute at long ranges) is still
+## traversing the tileset. INF = the old behaviour (root frontier only).
+@export var coarse_screen_space_error: float = 64.0
+## Concurrent payload downloads. Google/ion serve tiles at ~5 per second on one
+## connection; six in flight brings the near ground in several times faster.
+## 1 = sequential (deterministic order; what the synthetic tests use).
+@export_range(1, 16) var download_workers: int = 6
+## A camera must move this far (m) or turn this much (deg) before the change
+## counts as a new view that pre-empts the running downloads. Below this the
+## chase camera's per-frame drift kept restarting the download queue.
+@export var view_change_position_m: float = 1.0
+@export var view_change_angle_deg: float = 1.0
+
 const MAX_PENDING_RESULTS := 256
+## Payloads a superseded selection may still fetch before yielding to the
+## newer view (the plan itself is already published and independently useful).
+const SUPERSEDED_PAYLOAD_BATCH := 16
 const MAX_INCOMING_TILES := 256
 const MAX_TILESET_DOCUMENTS := 4096
 
@@ -179,6 +199,8 @@ var _tileset_root_url := ""
 var _is_google := false
 var _document_cache: Dictionary = {}
 var _selection_budget_exhausted := false
+var _auth_stale := false                 ## set by download workers on 400/401/403 (mutex)
+var _download_threads: Array[Thread] = []  ## streaming-thread-only: in-flight payload workers
 var _next_request_failure_report_msec := 0
 
 
@@ -322,6 +344,31 @@ func _camera_snapshots() -> Array:
 	return views
 
 
+## True when the camera set changed in a way worth re-planning for: a camera
+## added/removed, a viewport or lens change, or any camera moving more than
+## `position_m` / turning more than `angle_deg`. Sub-threshold drift (the chase
+## camera easing, a hovering vehicle's jitter) is NOT a new view.
+static func _views_differ(a: Array, b: Array, position_m: float, angle_deg: float) -> bool:
+	if a.size() != b.size():
+		return true
+	var cos_limit := cos(deg_to_rad(maxf(angle_deg, 0.0)))
+	for index in a.size():
+		var va: Dictionary = a[index]
+		var vb: Dictionary = b[index]
+		if (va["position"] as Vector3).distance_to(vb["position"]) > position_m:
+			return true
+		if (va["forward"] as Vector3).dot(vb["forward"]) < cos_limit \
+				or (va["up"] as Vector3).dot(vb["up"]) < cos_limit:
+			return true
+		if not is_equal_approx(float(va["tan_half_fov_x"]), float(vb["tan_half_fov_x"])) \
+				or not is_equal_approx(float(va["tan_half_fov_y"]), float(vb["tan_half_fov_y"])) \
+				or not is_equal_approx(float(va["viewport_height"]), float(vb["viewport_height"])) \
+				or not is_equal_approx(float(va["near"]), float(vb["near"])) \
+				or not is_equal_approx(float(va["far"]), float(vb["far"])):
+			return true
+	return false
+
+
 ## Coalesce targets without cancelling an in-flight traversal. Completed plans
 ## remain useful; payload downloading yields to a changed view after a small
 ## batch, rather than delaying a camera switch behind the entire old cut.
@@ -330,7 +377,8 @@ func _poll(lat: float, lon: float, alt: float) -> void:
 	var views := _camera_snapshots()
 	_mutex.lock()
 	if lat != _target_lat or lon != _target_lon or alt != _target_alt \
-			or _anchor_generation != _target_generation or views != _target_views \
+			or _anchor_generation != _target_generation \
+			or _views_differ(views, _target_views, view_change_position_m, view_change_angle_deg) \
 			or streaming_radius_km != _target_radius_km or far_radius_km != _target_far_radius_km \
 			or maximum_screen_space_error != _target_maximum_sse:
 		_target_change_revision = _view_revision
@@ -651,6 +699,10 @@ func _apply_selection(event: Dictionary) -> void:
 		for group in _replacement_groups.values():
 			if int(group.get("selected_revision", -1)) >= 0:
 				group["selected_revision"] = _accepted_view_revision
+		# A coarse-LOD pass carries its own parent->children relations; register
+		# them so its groups can promote as they complete, ahead of the fine pass.
+		for transition in event.get("transitions", []):
+			_register_transition(transition)
 		_try_all_promotions()
 		_rebuild_protected_tile_ids()
 		return
@@ -772,6 +824,7 @@ func _stream_loop() -> void:
 		if not _thread_running():
 			break
 		while _thread_running():
+			_join_downloads()
 			_mutex.lock()
 			var snapshot := {
 				"lat": _target_lat, "lon": _target_lon, "alt": _target_alt,
@@ -798,6 +851,7 @@ func _stream_loop() -> void:
 			_mutex.unlock()
 			if not newer:
 				break
+	_join_downloads()
 
 
 func _thread_running() -> bool:
@@ -943,24 +997,59 @@ func _find_session_token(tile: Dictionary) -> String:
 
 func _run_selection(snapshot: Dictionary) -> void:
 	_selection_budget_exhausted = false
+	_mutex.lock()
+	var auth_stale := _auth_stale
+	_auth_stale = false
+	_mutex.unlock()
+	if auth_stale:
+		_document_cache.clear()
 	var desired := {}
 	var active_documents := {}
 	var transitions := []
-	# Admit the complete coarse frontier before spending slots on detail.
-	# Planning never queues GLB payloads, so a full payload queue cannot block
-	# the control decision that releases obsolete residency.
-	var coarse := _walk_tileset_live(_tileset_root_url, Transform3D.IDENTITY, snapshot,
-			desired, active_documents, "", max_tiles_loaded, false, false, transitions)
+	# Admit a complete COARSE cut before spending slots on detail: the root
+	# frontier refined only down to `coarse_screen_space_error`. Few, large
+	# tiles -> a plan in seconds and real ground on screen while the fine pass
+	# below is still traversing. Planning never queues GLB payloads, so a full
+	# payload queue cannot block the control decision that releases residency.
+	var coarse_snapshot := snapshot.duplicate()
+	coarse_snapshot["maximum_sse"] = maxf(coarse_screen_space_error, float(snapshot["maximum_sse"]))
+	var coarse_refines := is_finite(coarse_screen_space_error)
+	var coarse := _walk_tileset_live(_tileset_root_url, Transform3D.IDENTITY, coarse_snapshot,
+			desired, active_documents, "", max_tiles_loaded, coarse_refines, false, transitions)
 	if not coarse["ok"] or not coarse["complete"] or not _thread_running():
 		return
 	var sent := {}
 	for id in snapshot["known_ids"]:
 		sent[String(id)] = true
 	_publish_selection(snapshot, desired, transitions, 0)
-	_download_selection(desired, snapshot, sent)
+	# Coarse payloads are the fallback everything else stands on: fetch them all
+	# (no yielding to a newer view) and let them download WHILE the fine pass
+	# traverses, instead of serialising the two.
+	_download_selection(desired, snapshot, sent, false, true)
+	_selection_budget_exhausted = false
 	active_documents.clear()
+	_mutex.lock()
+	var superseded := _target_change_revision > int(snapshot["view_revision"])
+	_mutex.unlock()
+	if superseded:
+		# The view moved on during the coarse pass. Re-plan for the new target
+		# now (its documents are cached, so that is quick) rather than spend a
+		# long fine traversal on a stale view.
+		_join_downloads()
+		return
 	var detailed := _walk_tileset_live(_tileset_root_url, Transform3D.IDENTITY, snapshot,
 			desired, active_documents, "", max_tiles_loaded, true, false, transitions)
+	_join_downloads()
+	_mutex.lock()
+	auth_stale = _auth_stale
+	_auth_stale = false
+	_mutex.unlock()
+	if auth_stale:
+		# A payload was refused during this pass: the sessions behind the cached
+		# documents are stale, so the detailed plan built on them is not
+		# trustworthy. Drop the cache; the coarse plan stands until the next pass.
+		_document_cache.clear()
+		return
 	if detailed["ok"] and detailed["complete"] and _thread_running():
 		_publish_selection(snapshot, desired, transitions, 1)
 		_download_selection(desired, snapshot, sent)
@@ -977,30 +1066,153 @@ func _publish_selection(snapshot: Dictionary, desired: Dictionary,
 	})
 
 
-func _download_selection(desired: Dictionary, snapshot: Dictionary, sent: Dictionary) -> void:
-	var attempted := 0
-	# Preserve provider order within each class while admitting local safety and
-	# collision coverage before payloads needed only by a distant camera view.
+## `yield_to_newer` lets a superseded selection stop after
+## SUPERSEDED_PAYLOAD_BATCH payloads (the fine pass); the coarse pass passes
+## false so its fallback coverage always completes. `async` returns as soon as
+## the worker threads are started — call _join_downloads() before reusing
+## `sent` or `desired`; sequential (1 worker) downloads always run inline.
+func _download_selection(desired: Dictionary, snapshot: Dictionary, sent: Dictionary,
+		yield_to_newer: bool = true, async: bool = false) -> void:
+	_join_downloads()
+	var attempted := [0]
+	# Local safety / collision coverage first, then everything a camera can see;
+	# within each class the payload nearest a camera (or the vehicle) goes first,
+	# so the ground under and ahead of the vehicle fills in before the horizon.
 	for priority in 2:
+		var batch: Array[String] = []
 		for id in desired:
 			if sent.has(id):
 				continue
-			var request: Dictionary = desired[id]
-			if _bounds_intersect_local(request["bounds"], snapshot) != (priority == 0):
+			if _bounds_intersect_local(desired[id]["bounds"], snapshot) != (priority == 0):
 				continue
-			# Yield at backpressure; the admitted plan is already independently
-			# available to the main thread. A later snapshot resumes missing data.
+			batch.append(String(id))
+		if batch.is_empty():
+			continue
+		var distances := {}
+		var radii := {}
+		for id in batch:
+			var bounds: Dictionary = desired[id]["bounds"]
+			distances[id] = _view_distance(bounds, snapshot)
+			radii[id] = float(bounds.get("radius", INF))
+		# Nearest first; among tiles that enclose the camera (distance 0, i.e. a
+		# whole ancestor chain) the COARSER one first — it is the fallback the
+		# finer ones replace, so it is what can be shown soonest.
+		batch.sort_custom(func(a: String, b: String) -> bool:
+			var da := float(distances[a])
+			var db := float(distances[b])
+			if not is_equal_approx(da, db):
+				return da < db
+			return float(radii[a]) > float(radii[b]))
+		var workers := maxi(1, download_workers)
+		if workers == 1:
+			for id in batch:
+				if not _download_one(id, desired, snapshot, sent, attempted, yield_to_newer):
+					return
+			continue
+		var cursor := [0]
+		var stopped := [false]
+		if async and priority == 0:
+			# Both classes must still run in order: the worker pool drains the
+			# whole ordered list, which already has local payloads first.
+			var rest: Array[String] = []
+			for id in desired:
+				if sent.has(id) or batch.has(String(id)):
+					continue
+				rest.append(String(id))
+			var rest_dist := {}
+			var rest_radii := {}
+			for id in rest:
+				var bounds: Dictionary = desired[id]["bounds"]
+				rest_dist[id] = _view_distance(bounds, snapshot)
+				rest_radii[id] = float(bounds.get("radius", INF))
+			rest.sort_custom(func(a: String, b: String) -> bool:
+				var da := float(rest_dist[a])
+				var db := float(rest_dist[b])
+				if not is_equal_approx(da, db):
+					return da < db
+				return float(rest_radii[a]) > float(rest_radii[b]))
+			batch.append_array(rest)
+		for _w in mini(workers, batch.size()):
+			var thread := Thread.new()
+			thread.start(_download_worker.bind(batch, cursor, stopped, desired, snapshot, sent,
+					attempted, yield_to_newer))
+			_download_threads.append(thread)
+		if async:
+			return
+		_join_downloads()
+		if stopped[0]:
+			return
+
+
+## Wait for any asynchronous download workers started by _download_selection.
+func _join_downloads() -> void:
+	for thread in _download_threads:
+		if thread.is_started():
+			thread.wait_to_finish()
+	_download_threads.clear()
+
+
+## Pool worker: pull the next payload off the shared batch until it is drained
+## or one fetch reports a stop condition. `sent` / `attempted` are shared with
+## the other workers and guarded by the streamer mutex inside _download_one.
+func _download_worker(batch: Array[String], cursor: Array, stopped: Array,
+		desired: Dictionary, snapshot: Dictionary, sent: Dictionary, attempted: Array,
+		yield_to_newer: bool) -> void:
+	while true:
+		_mutex.lock()
+		var index: int = cursor[0]
+		cursor[0] = index + 1
+		var stop: bool = stopped[0]
+		_mutex.unlock()
+		if stop or index >= batch.size():
+			return
+		if not _download_one(batch[index], desired, snapshot, sent, attempted, yield_to_newer):
 			_mutex.lock()
-			var full := _pending_results.size() >= MAX_PENDING_RESULTS
-			var superseded := _target_change_revision > int(snapshot["view_revision"])
+			stopped[0] = true
 			_mutex.unlock()
-			if full or (superseded and attempted >= 4) or not _thread_running():
-				return
-			if _fetch_content(request["url"], id, request["transform"],
-					request["bounding_volume"], request["bounds"],
-					request["pending_parent"], snapshot):
-				sent[id] = true
-			attempted += 1
+			return
+
+
+## Fetch one payload unless a stop condition holds. Returns false to stop the
+## whole selection's downloads: queue backpressure, a genuinely newer target
+## after SUPERSEDED_PAYLOAD_BATCH attempts, or shutdown. The admitted plan is
+## already independently available to the main thread; a later snapshot
+## resumes whatever is still missing.
+func _download_one(id: String, desired: Dictionary, snapshot: Dictionary,
+		sent: Dictionary, attempted: Array, yield_to_newer: bool = true) -> bool:
+	var request: Dictionary = desired[id]
+	_mutex.lock()
+	var full := _pending_results.size() >= MAX_PENDING_RESULTS
+	var superseded := yield_to_newer and _target_change_revision > int(snapshot["view_revision"])
+	var count: int = attempted[0]
+	var running := _running
+	if not (full or (superseded and count >= SUPERSEDED_PAYLOAD_BATCH) or not running):
+		attempted[0] = count + 1
+	_mutex.unlock()
+	if full or (superseded and count >= SUPERSEDED_PAYLOAD_BATCH) or not running:
+		return false
+	if _fetch_content(request["url"], id, request["transform"],
+			request["bounding_volume"], request["bounds"],
+			request["pending_parent"], snapshot):
+		_mutex.lock()
+		sent[id] = true
+		_mutex.unlock()
+	return true
+
+
+## Distance (m) from the nearest camera to a payload's bounds, or from the local
+## centre when there is no camera view. Unknown bounds sort last.
+static func _view_distance(bounds: Dictionary, snapshot: Dictionary) -> float:
+	var radius := float(bounds.get("radius", INF))
+	if not is_finite(radius):
+		return INF
+	var center: Vector3 = bounds.get("center", Vector3.ZERO)
+	var best := INF
+	for view in snapshot.get("views", []):
+		best = minf(best, center.distance_to(view["position"]))
+	if not is_finite(best):
+		best = center.distance_to(snapshot.get("local_center", Vector3.ZERO))
+	return maxf(best - radius, 0.0)
 
 
 func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapshot: Dictionary,
@@ -1121,6 +1333,8 @@ func _walk_tile_live(tile: Dictionary, parent_transform: Transform3D, base_url: 
 	var transition_start := transitions.size()
 	# First obtain every sibling's coarse coverage. Only then may any visible
 	# sibling consume the remaining budget with deeper refinement.
+	if download_workers > 1:
+		_prefetch_child_documents(children, base_url)
 	for child in children:
 		var result := _walk_tile_live(child, transform, base_url, snapshot, desired,
 				active_documents, child_pending, budget, refine, false,
@@ -1175,6 +1389,64 @@ func _walk_tile_live(tile: Dictionary, parent_transform: Transform3D, base_url: 
 
 
 
+## Fetch the external tileset documents a tile's children point at IN PARALLEL
+## into the document cache, so the sequential walk below finds them ready.
+## Google's tree is a nested document per level and per region; one request at
+## a time made the first plan take ~15 s at 1080p. Failures are simply left
+## uncached — the walk refetches and reports them itself.
+func _prefetch_child_documents(children: Array, base_url: String) -> void:
+	var pending: Array = []   # [content_url, request_url, cache_key]
+	for child in children:
+		for content in _tile_contents(child):
+			var uri := String(content.get("uri", content.get("url", "")))
+			if uri == "":
+				continue
+			var content_url := _resolve_relative_url(base_url, uri)
+			if not _canonical_content_uri(content_url).split("?", true, 1)[0].ends_with(".json"):
+				continue
+			var request_url := _apply_auth(content_url, true)
+			var cache_key := request_url.sha256_text()
+			if _document_cache.has(cache_key):
+				continue
+			pending.append([content_url, request_url, cache_key])
+	if pending.size() < 2 or not _thread_running():
+		return
+	var results := []
+	results.resize(pending.size())
+	var cursor := [0]
+	var threads: Array[Thread] = []
+	for _w in mini(download_workers, pending.size()):
+		var thread := Thread.new()
+		thread.start(_prefetch_worker.bind(pending, cursor, results))
+		threads.append(thread)
+	for thread in threads:
+		thread.wait_to_finish()
+	for index in pending.size():
+		var resp = results[index]
+		if resp == null or not resp.get("ok", false):
+			continue
+		var doc = JSON.parse_string((resp["body"] as PackedByteArray).get_string_from_utf8())
+		if not (doc is Dictionary) or not doc.has("root"):
+			continue
+		if _document_cache.size() >= MAX_TILESET_DOCUMENTS:
+			_document_cache.erase(_document_cache.keys()[0])
+		_document_cache[pending[index][2]] = doc
+
+
+func _prefetch_worker(pending: Array, cursor: Array, results: Array) -> void:
+	while _thread_running():
+		_mutex.lock()
+		var index: int = cursor[0]
+		cursor[0] = index + 1
+		_mutex.unlock()
+		if index >= pending.size():
+			return
+		var resp := _http_get(String(pending[index][1]))
+		_mutex.lock()
+		results[index] = resp
+		_mutex.unlock()
+
+
 static func _bounds_intersect_local(bounds: Dictionary, snapshot: Dictionary) -> bool:
 	var delta: Vector3 = (bounds["center"] as Vector3) - (snapshot["local_center"] as Vector3)
 	var reach := float(snapshot["local_radius"]) + float(bounds["radius"])
@@ -1204,7 +1476,11 @@ func _fetch_content(content_url: String, id: String, transform: Transform3D,
 	var resp := _http_get(_apply_auth(content_url))
 	if not resp["ok"]:
 		if int(resp.get("status", 0)) in [400, 401, 403]:
-			_document_cache.clear()
+			# Download workers run beside the traversal: flag the stale session
+			# and let the traversal thread drop its document cache itself.
+			_mutex.lock()
+			_auth_stale = true
+			_mutex.unlock()
 		if _thread_running():
 			_report_request_failure("tile payload", content_url, resp)
 		return false
@@ -1262,7 +1538,21 @@ static func _resolve_relative_url(base: String, uri: String) -> String:
 	return base_dir + uri
 
 
-var _http_clients: Dictionary = {}  ## thread-local only: "host:port" -> HTTPClient, kept alive across requests
+## Per-thread connection pools: thread id -> {"host:port": HTTPClient}. Each
+## download worker (and the traversal thread) keeps its own live TLS sessions;
+## HTTPClient itself is not shareable across threads.
+var _http_clients_by_thread: Dictionary = {}
+var _http_pool_mutex := Mutex.new()
+
+
+func _thread_http_clients() -> Dictionary:
+	var thread_id := OS.get_thread_caller_id()
+	_http_pool_mutex.lock()
+	var clients: Dictionary = _http_clients_by_thread.get(thread_id, {})
+	if not _http_clients_by_thread.has(thread_id):
+		_http_clients_by_thread[thread_id] = clients
+	_http_pool_mutex.unlock()
+	return clients
 
 
 ## Blocking GET via Godot's low-level HTTPClient -- fine to call from a
@@ -1279,6 +1569,7 @@ func _http_get(url: String, _retried: bool = false) -> Dictionary:
 	if parsed.is_empty():
 		return {"ok": false, "error": "could not parse content URL"}
 	var key: String = "%s:%d" % [parsed["host"], parsed["port"]]
+	var _http_clients := _thread_http_clients()
 
 	var client: HTTPClient = _http_clients.get(key)
 	if client == null:

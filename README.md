@@ -398,6 +398,23 @@ throttled, credential-safe engine diagnostics.
 The local-safety footprint is horizontal, so flight altitude does not remove
 the ground beneath the vehicle from selection.
 
+**How fast ground appears.** Every new view is planned twice. A COARSE pass
+first refines only down to `coarse_screen_space_error` (default 64 px): few,
+large tiles, so it plans in seconds and its payloads are fetched without ever
+yielding to a newer view — measured in PicoField at 1080p, real ground under the
+vehicle at ~13 s from launch, where the previous single fine pass showed
+nothing for minutes. The fine pass (`maximum_screen_space_error`) traverses
+while those coarse payloads download and refines the cut when it completes.
+Payloads are fetched by `download_workers` (default 6) concurrent connections,
+nearest camera first within each class (local safety coverage always before
+distant-only tiles), and the nested tileset documents each level points at are
+prefetched in parallel. A camera has to move `view_change_position_m` (1 m) or
+turn `view_change_angle_deg` (1°) before it counts as a new view; the
+chase camera's per-frame drift no longer restarts the download queue. Time to
+full detail is dominated by metadata round-trips, so a shorter `far_radius_km`
+and a larger error target (10 km / 8 px is a good sim default) pay off far more
+than bandwidth.
+
 `max_tiles_loaded` bounds resident tile instances (default 1536), and
 `tiles_per_frame_budget` bounds main-thread tile placement per frame (default
 4). When the detail budget fills, remaining branches retain coarse coverage;

@@ -117,6 +117,11 @@ func _new_streamer(document: Dictionary, max_loaded: int = 64,
 	streamer._tileset_root_url = ROOT_URL
 	streamer.max_tiles_loaded = max_loaded
 	streamer.tiles_per_frame_budget = placement_budget
+	# Deterministic, single-threaded fetch order (the mock _http_get is not
+	# thread-safe) and the classic root-frontier coarse pass, so these fixtures
+	# exercise one behaviour at a time. The coarse-LOD pass has its own test.
+	streamer.download_workers = 1
+	streamer.coarse_screen_space_error = INF
 	streamer.responses[ROOT_URL] = document
 	root.add_child(streamer)
 	return streamer
@@ -968,15 +973,18 @@ func _test_local_payloads_precede_distant_visible_payloads() -> void:
 	var admission_order := PackedStringArray()
 	for tile in streamer._pending_results:
 		admission_order.append(String(tile["id"]))
+	# The camera sits at the origin: within each class the payload nearest the
+	# camera is fetched first (local-b at 100 m before local-a at 200 m; far-b at
+	# 6 km before far-a at 7 km), and every local payload precedes every far one.
 	_check(payload_order == PackedStringArray([
-				"order-local-a.glb", "order-local-b.glb",
-				"order-far-a.glb", "order-far-b.glb",
+				"order-local-b.glb", "order-local-a.glb",
+				"order-far-b.glb", "order-far-a.glb",
 			])
 			and admission_order == PackedStringArray([
-				_id("order-local-a.glb"), _id("order-local-b.glb"),
-				_id("order-far-a.glb"), _id("order-far-b.glb"),
+				_id("order-local-b.glb"), _id("order-local-a.glb"),
+				_id("order-far-b.glb"), _id("order-far-a.glb"),
 			]),
-			"local coarse payloads are fetched and admitted first without disturbing provider order within either class")
+			"local coarse payloads are fetched and admitted first, nearest the camera first within each class")
 
 
 func _test_camera_offsets_are_snapshotted() -> void:
@@ -1004,10 +1012,11 @@ func _test_camera_offsets_are_snapshotted() -> void:
 
 
 func _test_payload_scheduler_yields_only_to_real_target_changes() -> void:
+	var batch := GWTiles3DStreamer.SUPERSEDED_PAYLOAD_BATCH
 	var streamer := _new_streamer(_document(
-			_content_tile("scheduler-root.glb", _anchor_ecef)), 8, 8)
+			_content_tile("scheduler-root.glb", _anchor_ecef)), batch * 2, batch * 2)
 	var desired := {}
-	for index in 8:
+	for index in batch * 2:
 		var path := "scheduler-%d.glb" % index
 		var url := "https://synthetic.test/" + path
 		streamer.responses[url] = GLTF_SENTINEL
@@ -1023,15 +1032,79 @@ func _test_payload_scheduler_yields_only_to_real_target_changes() -> void:
 
 	streamer._target_change_revision = 5
 	streamer._download_selection(desired, snapshot, sent)
-	_check(streamer._pending_results.size() == 8 and sent.size() == 8,
+	_check(streamer._pending_results.size() == batch * 2 and sent.size() == batch * 2,
 			"an unchanged target lets the worker finish the full payload batch")
 
 	streamer._pending_results.clear()
 	sent.clear()
 	streamer._target_change_revision = 6
 	streamer._download_selection(desired, snapshot, sent)
-	_check(streamer._pending_results.size() == 4 and sent.size() == 4,
-			"a genuinely newer target yields the old download after four payload attempts")
+	_check(streamer._pending_results.size() == batch and sent.size() == batch,
+			"a genuinely newer target yields the old download after SUPERSEDED_PAYLOAD_BATCH attempts")
+
+
+func _test_view_jitter_is_not_a_new_target() -> void:
+	var base := _view(Vector3.FORWARD)
+	var jitter := base.duplicate()
+	jitter["position"] = Vector3(0.2, 0.0, 0.0)
+	var moved := base.duplicate()
+	moved["position"] = Vector3(3.0, 0.0, 0.0)
+	var turned := base.duplicate()
+	turned["forward"] = Vector3(sin(deg_to_rad(5.0)), 0.0, -cos(deg_to_rad(5.0)))
+	var zoomed := base.duplicate()
+	zoomed["tan_half_fov_y"] = 0.25
+	_check(not GWTiles3DStreamer._views_differ([jitter], [base], 1.0, 1.0),
+			"a 20 cm camera drift is the same target")
+	_check(GWTiles3DStreamer._views_differ([moved], [base], 1.0, 1.0),
+			"a 3 m camera move is a new target")
+	_check(GWTiles3DStreamer._views_differ([turned], [base], 1.0, 1.0),
+			"a 5 deg turn is a new target")
+	_check(GWTiles3DStreamer._views_differ([zoomed], [base], 1.0, 1.0),
+			"a lens change is a new target")
+	_check(GWTiles3DStreamer._views_differ([base, base], [base], 1.0, 1.0),
+			"adding a camera is a new target")
+
+
+func _test_coarse_pass_refines_to_coarse_sse() -> void:
+	# Root content with two children; a big geometric error makes the root's
+	# projected error exceed even the coarse threshold, so the coarse pass
+	# (phase 0) must already plan the children and their replacement group.
+	var child_a_ecef := _anchor_ecef + Vector3(0.0, 40.0, 0.0)
+	var child_b_ecef := _anchor_ecef + Vector3(0.0, -40.0, 0.0)
+	var root_tile := _content_tile("coarse-root.glb", _anchor_ecef, 500.0, [
+		_content_tile("coarse-child-a.glb", child_a_ecef),
+		_content_tile("coarse-child-b.glb", child_b_ecef),
+	])
+	var streamer := _new_streamer(_document(root_tile))
+	streamer.coarse_screen_space_error = 32.0
+	_serve_content(streamer, ["coarse-root.glb", "coarse-child-a.glb", "coarse-child-b.glb"])
+	var snapshot := _snapshot(streamer, 1, [_view(Vector3.FORWARD)])
+	snapshot["maximum_sse"] = 1.0
+	streamer._run_selection(snapshot)
+	var phase_zero: Dictionary = streamer._pending_plans[2]
+	var ids := PackedStringArray(phase_zero["desired_ids"])
+	_check(ids.has(_id("coarse-child-a.glb")) and ids.has(_id("coarse-child-b.glb")),
+			"the coarse pass plans past the root when the root's error exceeds the coarse threshold")
+	_check(not (phase_zero["transitions"] as Array).is_empty(),
+			"the coarse pass publishes its replacement relations")
+	# Accept only phase zero and drain: the children must promote over the root
+	# without waiting for the fine plan.
+	streamer._pending_plans.erase(3)
+	for unused in 4:
+		streamer._drain_results()
+	_check(_is_visible(streamer, _id("coarse-child-a.glb"))
+			and _is_visible(streamer, _id("coarse-child-b.glb"))
+			and not _is_visible(streamer, _id("coarse-root.glb")),
+			"coarse-pass children replace the root as soon as they are all placed")
+	# With the threshold at INF the old root-frontier behaviour is unchanged.
+	var classic := _new_streamer(_document(root_tile))
+	_serve_content(classic, ["coarse-root.glb", "coarse-child-a.glb", "coarse-child-b.glb"])
+	var classic_snapshot := _snapshot(classic, 1, [_view(Vector3.FORWARD)])
+	classic_snapshot["maximum_sse"] = 1.0
+	classic._run_selection(classic_snapshot)
+	var classic_zero: Dictionary = classic._pending_plans[2]
+	_check(PackedStringArray(classic_zero["desired_ids"]) == PackedStringArray([_id("coarse-root.glb")]),
+			"INF coarse threshold keeps phase zero at the root frontier")
 
 
 func _initialize() -> void:
@@ -1061,6 +1134,8 @@ func _run() -> void:
 	_test_local_payloads_precede_distant_visible_payloads()
 	_test_camera_offsets_are_snapshotted()
 	_test_payload_scheduler_yields_only_to_real_target_changes()
+	_test_view_jitter_is_not_a_new_target()
+	_test_coarse_pass_refines_to_coarse_sse()
 
 	print("\ntest_live_streamer: ", "PASS" if _ok else "FAIL")
 	quit(0 if _ok else 1)
