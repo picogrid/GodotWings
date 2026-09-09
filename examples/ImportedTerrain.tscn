@@ -40,6 +40,5 @@ home_lat = 60.221
 home_lon = 25.018
 vehicle_path = NodePath("../Aircraft")
 streaming_radius_km = 1.0
-detail_m = 100.0
 reanchor_distance_m = 200.0
 metadata/_custom_type_script = "uid://b3nwft5t5ia7t"

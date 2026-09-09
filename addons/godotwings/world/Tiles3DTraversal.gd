@@ -110,6 +110,172 @@ static func bounding_volume_overlaps_aoi(bv: Dictionary, world_transform: Transf
 	return true
 
 
+## Converts a 3D Tiles bounding volume into one conservative sphere in the
+## streamer's current anchor-local Godot frame, with `error_scale` carrying
+## the cumulative transform's largest scale for geometric-error projection.
+## `region` is already geodetic and therefore does not inherit the tile
+## transform for its geometry. Unknown/malformed volumes deliberately return
+## an infinite sphere so callers never cull data merely because a provider
+## introduced a volume form we do not understand.
+static func bounding_sphere(bv: Dictionary, world_transform: Transform3D,
+		anchor_lat: float, anchor_lon: float, anchor_alt: float) -> Dictionary:
+	if bv.has("sphere"):
+		var sphere: Array = bv["sphere"]
+		if sphere.size() >= 4:
+			var ecef_center := world_transform * Vector3(
+					float(sphere[0]), float(sphere[1]), float(sphere[2]))
+			var error_scale := _basis_radius_scale(world_transform.basis)
+			return {
+				"center": GWGeodeticConvert.ecef_xyz_to_godot_position(
+						ecef_center.x, ecef_center.y, ecef_center.z,
+						anchor_lat, anchor_lon, anchor_alt),
+				"radius": absf(float(sphere[3])) * error_scale,
+				"error_scale": error_scale,
+			}
+
+	if bv.has("box"):
+		var box: Array = bv["box"]
+		if box.size() >= 12:
+			var ecef_center := world_transform * Vector3(
+					float(box[0]), float(box[1]), float(box[2]))
+			var axis_x := world_transform.basis * Vector3(
+					float(box[3]), float(box[4]), float(box[5]))
+			var axis_y := world_transform.basis * Vector3(
+					float(box[6]), float(box[7]), float(box[8]))
+			var axis_z := world_transform.basis * Vector3(
+					float(box[9]), float(box[10]), float(box[11]))
+			var radius := maxf(
+					maxf((axis_x + axis_y + axis_z).length(), (axis_x + axis_y - axis_z).length()),
+					maxf((axis_x - axis_y + axis_z).length(), (-axis_x + axis_y + axis_z).length()))
+			return {
+				"center": GWGeodeticConvert.ecef_xyz_to_godot_position(
+						ecef_center.x, ecef_center.y, ecef_center.z,
+						anchor_lat, anchor_lon, anchor_alt),
+				"radius": radius,
+				"error_scale": _basis_radius_scale(world_transform.basis),
+			}
+
+	if bv.has("region"):
+		var region: Array = bv["region"]
+		if region.size() >= 6:
+			var west := float(region[0])
+			var south := float(region[1])
+			var east := float(region[2])
+			var north := float(region[3])
+			var min_height := float(region[4])
+			var max_height := float(region[5])
+			# Unwrap eastward across the antimeridian before taking the
+			# midpoint. The radius uses a surface-path upper bound rather than
+			# a corner fit: corner-only spheres can cut through the ellipsoid's
+			# curved edges and silently omit real terrain.
+			var lon_span := fposmod(east - west, TAU)
+			if is_equal_approx(lon_span, 0.0) and not is_equal_approx(east, west):
+				lon_span = TAU
+			var center_lon := wrapf(west + 0.5 * lon_span, -PI, PI)
+			var center_lat := 0.5 * (south + north)
+			var center_height := 0.5 * (min_height + max_height)
+			var center_xyz := GWGeodeticConvert.geodetic_to_ecef_xyz(
+					rad_to_deg(center_lat), rad_to_deg(center_lon), center_height)
+			var min_abs_lat := 0.0 if south <= 0.0 and north >= 0.0 \
+					else minf(absf(south), absf(north))
+			var max_parallel_factor := cos(minf(min_abs_lat, PI * 0.5))
+			var curvature_upper_bound := R_EQ / (1.0 - GWGeodeticConvert.E2) \
+					+ maxf(absf(min_height), absf(max_height))
+			var surface_path_bound := curvature_upper_bound * (
+					0.5 * absf(north - south)
+					+ minf(PI, 0.5 * lon_span) * max_parallel_factor)
+			return {
+				"center": GWGeodeticConvert.ecef_xyz_to_godot_position(
+						center_xyz[0], center_xyz[1], center_xyz[2],
+						anchor_lat, anchor_lon, anchor_alt),
+				"radius": surface_path_bound + 0.5 * absf(max_height - min_height),
+				"error_scale": _basis_radius_scale(world_transform.basis),
+			}
+
+	return {
+		"center": Vector3.ZERO,
+		"radius": INF,
+		"error_scale": _basis_radius_scale(world_transform.basis),
+	}
+
+
+## Conservative largest stretch applied to a sphere and geometric error.
+## The spectral norm squared of a basis is the largest eigenvalue of its Gram
+## matrix A^T A; the maximum absolute row sum bounds that eigenvalue. This is
+## exact for rotations/axis scales and remains safe for arbitrarily small
+## shear, without a fragile "nearly orthogonal" epsilon branch.
+static func _basis_radius_scale(basis: Basis) -> float:
+	var xx := basis.x.length_squared()
+	var yy := basis.y.length_squared()
+	var zz := basis.z.length_squared()
+	var xy := absf(basis.x.dot(basis.y))
+	var xz := absf(basis.x.dot(basis.z))
+	var yz := absf(basis.y.dot(basis.z))
+	return sqrt(maxf(xx + xy + xz, maxf(yy + xy + yz, zz + xz + yz)))
+
+
+## Conservative perspective-frustum sphere test in camera-axis space.
+## Side-plane comparisons retain the sphere radius in plane-normal units, so
+## a sphere crossing an off-axis boundary remains visible. Near/far are
+## likewise intersection tests, not center tests.
+static func bounds_visible(bounds: Dictionary, view: Dictionary) -> bool:
+	var radius: float = float(bounds.get("radius", INF))
+	if not is_finite(radius):
+		return true
+	radius = absf(radius)
+	var center: Vector3 = bounds.get("center", Vector3.ZERO)
+	var position: Vector3 = view.get("position", Vector3.ZERO)
+	var forward: Vector3 = view.get("forward", Vector3.FORWARD)
+	var right: Vector3 = view.get("right", Vector3.RIGHT)
+	var up: Vector3 = view.get("up", Vector3.UP)
+	var offset := center - position
+	var depth := offset.dot(forward)
+	var horizontal := offset.dot(right)
+	var vertical := offset.dot(up)
+	var near_distance := maxf(0.0, float(view.get("near", 0.0)))
+	var far_distance := float(view.get("far", INF))
+	if depth + radius < near_distance or depth - radius > far_distance:
+		return false
+	var tan_x := maxf(0.0, float(view.get("tan_half_fov_x", 0.0)))
+	var tan_y := maxf(0.0, float(view.get("tan_half_fov_y", 0.0)))
+	var horizontal_margin := radius * sqrt(1.0 + tan_x * tan_x)
+	var vertical_margin := radius * sqrt(1.0 + tan_y * tan_y)
+	return absf(horizontal) <= depth * tan_x + horizontal_margin \
+			and absf(vertical) <= depth * tan_y + vertical_margin
+
+
+## Maximum transformed geometric error, in pixels, among views whose frusta
+## intersect the bounds. Distance is to the nearest point of the sphere,
+## making camera-inside bounds request refinement conservatively.
+static func screen_space_error(geometric_error: float, bounds: Dictionary, views: Array) -> float:
+	if geometric_error <= 0.0:
+		return 0.0
+	if views.is_empty():
+		return 0.0
+	var radius: float = absf(float(bounds.get("radius", INF)))
+	if not is_finite(radius):
+		return INF
+	var error_scale := absf(float(bounds.get("error_scale", 1.0)))
+	if not is_finite(error_scale):
+		return INF
+	var center: Vector3 = bounds.get("center", Vector3.ZERO)
+	var maximum := 0.0
+	for view_variant in views:
+		var view: Dictionary = view_variant
+		if not bounds_visible(bounds, view):
+			continue
+		var distance := center.distance_to(view.get("position", Vector3.ZERO)) - radius
+		if distance <= 1e-6:
+			return INF
+		var tan_y := float(view.get("tan_half_fov_y", 0.0))
+		var viewport_height := float(view.get("viewport_height", 0.0))
+		if tan_y <= 0.0 or viewport_height <= 0.0:
+			return INF
+		maximum = maxf(maximum,
+				geometric_error * error_scale * viewport_height / (2.0 * tan_y * distance))
+	return maximum
+
+
 ## b3dm = [28-byte header][feature table JSON+bin][batch table JSON+bin]
 ## [embedded glb]. Header: magic(4)='b3dm', version(4), byteLength(4),
 ## featureTableJSONByteLength(4), featureTableBinaryByteLength(4),

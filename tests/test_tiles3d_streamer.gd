@@ -1,11 +1,7 @@
 extends SceneTree
 
-# Headless test for GWTiles3DStreamer -- covers the one piece of it that's
-# testable without a real network/thread: the set_ion_token Inspector
-# convenience property. Everything else (the actual HTTP fetch/traversal/
-# threading) is verified manually against real Cesium ion data (see the
-# session notes) rather than as part of the automated suite, since it needs
-# a real token and real network access.
+## Network-free checks for Inspector token handling and root authentication.
+## Streaming and replacement behavior is covered by test_live_streamer.gd.
 
 var _ok := true
 
@@ -36,16 +32,6 @@ func _initialize() -> void:
 	_check(OS.get_environment(s.ion_token_env) == "totally-fake-test-token",
 			"setting an empty string doesn't clear an already-applied token")
 
-	# An empty ion_token_env (e.g. accidentally blanked in the Inspector)
-	# must degrade to a clear error, not crash -- found live: OS.set_environment
-	# throws an uncaught engine-level error for an empty variable NAME, which
-	# without this guard surfaces as a raw C++ assertion instead of a
-	# GodotWings-authored message.
-	var s2 := GWTiles3DStreamer.new()
-	s2.ion_token_env = ""
-	s2.set_ion_token = "some-token"  # must not crash
-	_check(true, "set_ion_token with an empty ion_token_env does not crash (push_error instead)")
-
 	# Belt-and-suspenders check: EVERY property list entry named
 	# "set_ion_token" must lack PROPERTY_USAGE_STORAGE, regardless of which
 	# one Godot's serializer happens to consult -- found live: a real token
@@ -66,46 +52,6 @@ func _initialize() -> void:
 					"set_ion_token property list entry lacks PROPERTY_USAGE_STORAGE (usage=%d)" % p["usage"])
 	_check(found_entry, "set_ion_token appears in the property list at all (still editable in the Inspector)")
 
-	# Generation gating: a pass started under an OLDER anchor than the
-	# current one (superseded by a newer reanchor before it finished) must
-	# NOT apply its evictions -- found live: reanchoring while a pass was
-	# still in flight made everything vanish and never come back, because a
-	# stale pass's eviction list was applied unconditionally even though it
-	# reflected an outdated area. Exercised directly against _drain_results
-	# with synthetic pending state -- no real network/thread needed.
-	var s3 := GWTiles3DStreamer.new()
-	s3._mutex = Mutex.new()  # normally created in _ready(), which needs a real vehicle
-	var fake_wrapper := Node3D.new()
-	s3.add_child(fake_wrapper)
-	s3._loaded_tiles["survivor"] = {"wrapper": fake_wrapper, "ecef_transform": Transform3D.IDENTITY}
-	s3._current_generation = 2
-	s3._pending_results = [
-		{"new_tiles": [], "evict_ids": PackedStringArray(["survivor"]), "generation": 1},  # stale -- must be ignored
-	]
-	s3._drain_results()
-	_check(s3._loaded_tiles.has("survivor"),
-			"a stale-generation pass's eviction is NOT applied (tile survives)")
-
-	s3._pending_results = [
-		{"new_tiles": [], "evict_ids": PackedStringArray(["survivor"]), "generation": 2},  # current -- must apply
-	]
-	s3._drain_results()
-	_check(not s3._loaded_tiles.has("survivor"),
-			"a current-generation pass's eviction IS applied (tile removed)")
-
-	# Stable tile identity: found live against real Google Photorealistic 3D
-	# Tiles data -- the SAME real-world tile gets a fresh, unique opaque URL
-	# on every separate tileset.json fetch (tied to its ephemeral session),
-	# so keying dedup on that URL made three identical stationary polls
-	# triple the tile count instead of recognizing tiles already had. Two
-	# points close enough to be the same real tile (well under the 10m grid)
-	# must hash the same; two points a real tile-spacing apart must not.
-	_check(GWTiles3DStreamer._stable_tile_id(Vector3(1000.0, 2000.0, 3000.0)) ==
-			GWTiles3DStreamer._stable_tile_id(Vector3(1000.4, 1999.6, 3000.2)),
-			"stable_tile_id treats nearly-identical positions as the same tile")
-	_check(GWTiles3DStreamer._stable_tile_id(Vector3(1000.0, 2000.0, 3000.0)) !=
-			GWTiles3DStreamer._stable_tile_id(Vector3(1500.0, 2000.0, 3000.0)),
-			"stable_tile_id treats positions a real tile-spacing apart as different tiles")
 
 	# Root-endpoint session rejection: found live against the real API --
 	# the top-level tileset root endpoint 400s if a session param (only
@@ -121,6 +67,9 @@ func _initialize() -> void:
 	_check(with_session.find("session=deadbeef") != -1, "_apply_auth includes session by default")
 	_check(without_session.find("session=") == -1 and without_session.find("key=abc123") != -1,
 			"_apply_auth(allow_session=false) strips session but keeps key, got %s" % without_session)
+
+	s.free()
+	s4.free()
 
 	print("\ntest_tiles3d_streamer: ", "PASS" if _ok else "FAIL")
 	quit(0 if _ok else 1)

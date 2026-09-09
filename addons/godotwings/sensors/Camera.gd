@@ -92,6 +92,12 @@ var _accum := 0.0
 var _frame_interval := 1.0 / 30.0
 
 
+## Actual off-screen camera, or null before setup / when rendering is disabled.
+## Consumers such as terrain LOD use its live pose, projection and viewport.
+func render_camera() -> Camera3D:
+	return _cam
+
+
 func _ready() -> void:
 	if not enabled:
 		set_process(false)
