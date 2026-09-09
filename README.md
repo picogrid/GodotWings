@@ -18,6 +18,7 @@ It ships as a Godot addon. Simply add it to your project, drop a few nodes and y
 
 Install [Godot 4.2+](https://godotengine.org/download), create / open a project and import GodotWings as an addon (addons/godotswings). 
 - GWAircraft and GWMulticopter nodes provide drag-and-drop, fully setup aircrats with dynamics, SITL endpoint, camera streaming (rtsp...) and gimbal. All easy to setup in the inspector
+- GWRover is the same for a wheeled ground vehicle (ArduRover): suspension, tyre friction, motor torque — see "Ground vehicles" below
 - GWView camera allows you to setup an in-Godot camera when not using the streaming camera attached to the drone 
 - GWWind provides very basic wind / turbulence 
 Examples/Main.tscn provides the most basic example. 
@@ -35,6 +36,7 @@ and video stream: 127.0.0.1:5600
 docker compose up --build                    # ArduPlane for GWAircraft
 NUM_VEHICLES=2 docker compose up # For multiple vehicle, see "#swarm"
 VEHICLE=ArduCopter docker compose up --build  # ArduCopter for GWMulticopter
+VEHICLE=Rover docker compose up --build       # ArduRover for GWRover
 ```
 
 **Start Godot before the container** — ArduPilot's JSON backend blocks waiting for physics and emits no MAVLink until Godot is replying. If the container starts
@@ -70,6 +72,9 @@ Throttle is **sticky**: it ramps up/down while you hold the key/stick and holds
 where you leave it (set `throttle_ramp`). If a control responds backwards for your
 airframe, flip the matching `invert_*` flag.
 
+A **rover** (`GWRover`) in manual mode drives like a car: ↑/↓ (pitch stick) is
+forward/reverse throttle, ←/→ (roll stick) steers; see "Ground vehicles" below.
+
 Manual mode is **raw and unstabilised** — sticks map straight to channels 1–4 in
 the AETR layout. A fixed-wing flies this directly (it's a real RC "manual" mode:
 surfaces deflect, no auto-level). A **multirotor receives channels 1–4 as raw
@@ -81,6 +86,81 @@ still works against a manual source.
 See `examples/Manual.tscn` for a runnable fixed-wing setup.
 
 
+
+## Ground vehicles (ArduRover)
+
+`GWRover` (`Rover.gd`, on `fdm/RoverBody.gd`) is the wheeled counterpart of
+`GWAircraft` / `GWMulticopter`: one node that self-assembles the SITL bridge, a
+visual model and an optional gimbal camera (the same `enable_camera` /
+`camera_gimbal` exports and mount-servo channels as the aircraft), and drives
+on the real colliders in the scene — a flat plane, `GWImportedTerrain`, or
+streamed Cesium 3D Tiles. Run SITL with `VEHICLE=Rover` (the container applies
+`docker/sitl-rover.parm`; Rover has its own frame parameters). See
+`examples/Rover.tscn` for a drive-it-yourself lot with a ramp and a curb.
+
+The model is a rigid chassis (CG at the node origin, box-estimated or explicit
+inertia tensor) on N independently sprung wheels — every one a real
+measurable quantity in `GWRoverConfig`:
+
+- **Suspension** per wheel: spring + damper sized from a natural frequency and
+  damping ratio (so the numbers mean the same on a 2 kg buggy and a 300 kg
+  UGV), preloaded to that wheel's static share of the weight, with travel
+  limits and bump stops. Squat under power, dive under braking, body roll in
+  corners and rollover all come out of this rather than being scripted.
+- **Tyres**: a DC-motor torque curve per driven wheel (`wheel_torque_max`
+  falling to zero at the no-load `max_speed`), neutral braking, rolling
+  resistance, and a lateral force that builds with slip velocity
+  (`lateral_stiffness`) — all inside a friction circle with static and sliding
+  coefficients (`mu_static` / `mu_kinetic`). Longitudinal wheel slip is solved
+  implicitly against the motor curve each sub-step, so a torquey launch spins
+  the wheels, a hard reverse locks them into a skid, and a skid-steer pivots
+  because its scrubbing tyres spend their grip longitudinally.
+- **Steering**: Ackermann (front axle by default, optional counter-steering
+  rear axle) or `SKID` (left/right sides driven separately, tracked-vehicle
+  style). `drive_layout` picks all-wheel, front or rear drive.
+- **Ground**: each wheel casts its own ray (`terrain_following`,
+  `ground_collision_mask`), short above the hub so bridges and canopies aren't
+  mistaken for the ground. All wheels airborne = a jump (`took_off` /
+  `landed`); landing harder than `max_landing_speed` or tipping past
+  `rollover_deg` is a crash and goes through the usual ragdoll / recovery.
+
+Channels follow ArduRover's servo outputs: 1 = ground steering (1500 centre,
+higher = right), 3 = throttle (1500 stop, 2000 full forward, 1000 full
+reverse). Skid steering reads channel 1 as the left side and 3 as the right
+(`SERVO1_FUNCTION 73`, `SERVO3_FUNCTION 74` on the autopilot). In manual mode
+(`control_source = Manual`, `manual_drive` on) the pitch stick is throttle and
+the roll stick steers.
+
+### Rover model standard (glTF)
+
+Drop any glTF into `model_scene` and, with `geometry_from_model` on (default),
+the sim reads the vehicle from it and animates the wheels — steer, roll and
+suspension travel — instead of you typing the geometry twice. Name the nodes:
+
+```
+RoverModel                  root (any name)
+├── Hull                    body mesh(es): prefix "Hull". Its bounding box is the
+│                           collision hull and the inertia box
+├── CG                      optional empty: centre of mass. Without it, the hull
+│                           box centre (else the model origin)
+├── Wheel_FL                one node per wheel, prefix "Wheel" (any suffix, any
+├── Wheel_FR                count ≥ 3, may live in a "Wheels" group). The node
+├── Wheel_RL                origin is the hub. The wheel mesh (the node or its
+└── Wheel_RR                children) is a disc: its thinnest axis is the axle,
+                            half its diameter the radius
+```
+
+Author it +Y up / −Z forward (or Onshape Z-up via `model_orientation`), sitting
+on its wheels. The wheels furthest forward are the steered axle and the
+furthest back the rear axle; six or eight wheels work the same way. Without a
+model, a placeholder box-and-cylinders rover is built from the config's
+`wheelbase` / `track` / `wheel_radius` / `cg_height` — it follows the same
+standard, so there is one code path.
+
+Under SITL the autopilot expects roughly the vehicle in `docker/sitl-rover.parm`
+(`CRUISE_SPEED`, `TURN_RADIUS`, the speed and steering rate gains): retune those
+when you change the config's `max_speed`, `max_steer_deg` or wheelbase, exactly
+as you would for a real rover.
 
 ## Camera & gimbal
 

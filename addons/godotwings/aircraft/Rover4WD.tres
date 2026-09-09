@@ -1,0 +1,42 @@
+; Default ground vehicle for GWRoverBody — a ~25 kg 4WD Ackermann-steered
+; utility rover (0.9 m wheelbase, 0.7 m track, 0.30 m wheels, CG 0.26 m up), 6 m/s top speed,
+; off-road-soft suspension and dirt-grade tyre grip. Tune to taste, or read the
+; geometry from your own model (see GWRover's model standard).
+[gd_resource type="Resource" script_class="GWRoverConfig" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/godotwings/fdm/RoverConfig.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+mass = 25.0
+Ixx = 0.0
+Iyy = 0.0
+Izz = 0.0
+wheelbase = 0.9
+track = 0.7
+wheel_radius = 0.15
+wheel_width = 0.08
+cg_height = 0.26
+cg_position = 0.5
+body_size = Vector3(1.1, 0.6, 0.3)
+body_center_height = 0.3
+suspension_freq_hz = 1.8
+suspension_damping_ratio = 0.6
+suspension_travel = 0.08
+drive_layout = 0
+wheel_torque_max = 8.0
+max_speed = 6.0
+motor_time_const = 0.08
+neutral_brake = 0.3
+steering_mode = 0
+max_steer_deg = 30.0
+steer_time_const = 0.12
+steer_front = true
+steer_rear = false
+mu_static = 0.9
+mu_kinetic = 0.7
+lateral_stiffness = 6.0
+rolling_resistance = 0.03
+drag_area = Vector3(0.25, 0.4, 0.6)
+rollover_deg = 65.0
+max_landing_speed = 4.0

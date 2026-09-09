@@ -1,5 +1,5 @@
-# ArduPilot ArduPlane SITL with the JSON physics backend (for GodotWings) and a
-# MAVLink output for QGroundControl / Mission Planner.
+# ArduPilot SITL (ArduPlane, ArduCopter, ArduRover) with the JSON physics backend
+# (for GodotWings) and a MAVLink output for QGroundControl / Mission Planner.
 #
 # Builds the SITL binary from source. Rather than ArduPilot's full
 # install-prereqs-ubuntu.sh (which also pulls ARM cross-compilers, SFML,
@@ -33,14 +33,15 @@ RUN git clone https://github.com/ArduPilot/ardupilot.git \
     && git checkout "${ARDUPILOT_TAG}" \
     && git submodule update --init --recursive
 
-# Build the SITL ArduPlane + ArduCopter binaries (pick at runtime via VEHICLE).
+# Build the SITL ArduPlane + ArduCopter + ArduRover binaries (pick at runtime via VEHICLE).
 WORKDIR /opt/ardupilot
-RUN ./waf configure --board sitl && ./waf plane && ./waf copter
+RUN ./waf configure --board sitl && ./waf plane && ./waf copter && ./waf rover
 
 # sim_vehicle.py on PATH.
 ENV PATH="/opt/ardupilot/Tools/autotest:${PATH}"
 
 COPY sitl-defaults.parm /sitl-defaults.parm
 COPY fpv-quad.parm /fpv-quad.parm
+COPY sitl-rover.parm /sitl-rover.parm
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

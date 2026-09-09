@@ -1,0 +1,10 @@
+; Ready-to-drive rover — one GWRover node that self-assembles its SITL bridge,
+; model, and (optional) camera. Instance into a scene with a camera, run SITL
+; with VEHICLE=Rover, and connect. Tick `enable_camera` for video; swap
+; `config` / `model_scene` for your own (see GWRover for the model standard).
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://addons/godotwings/Rover.gd" id="1_rv"]
+
+[node name="GWRover" type="Node3D"]
+script = ExtResource("1_rv")

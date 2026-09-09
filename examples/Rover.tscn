@@ -1,0 +1,85 @@
+[gd_scene load_steps=8 format=3]
+
+[ext_resource type="Script" path="res://addons/godotwings/Rover.gd" id="1_rover"]
+[ext_resource type="Script" path="res://addons/godotwings/camera/ViewCamera.gd" id="2_cam"]
+
+[sub_resource type="BoxMesh" id="Mesh_ground"]
+size = Vector3(400, 1, 400)
+
+[sub_resource type="StandardMaterial3D" id="Mat_ground"]
+albedo_color = Color(0.36, 0.33, 0.24, 1)
+
+[sub_resource type="BoxShape3D" id="Shape_ground"]
+size = Vector3(400, 1, 400)
+
+[sub_resource type="BoxMesh" id="Mesh_ramp"]
+size = Vector3(4, 0.3, 8)
+
+[sub_resource type="StandardMaterial3D" id="Mat_ramp"]
+albedo_color = Color(0.55, 0.55, 0.5, 1)
+
+[sub_resource type="BoxShape3D" id="Shape_ramp"]
+size = Vector3(4, 0.3, 8)
+
+; Drive-it-yourself rover on a flat lot with a ramp and a curb to bump over.
+; No SITL needed: ←/→ steer, ↑/↓ throttle, R resets. Terrain following is on
+; and the ground/ramps are on physics layer 1, so the wheels ride the real
+; colliders — swap the lot for a GWTiles3DStreamer / GWImportedTerrain and it
+; drives those the same way.
+[node name="RoverExample" type="Node3D"]
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.7, -0.5, 0.5, 0, 0.7, 0.7, -0.7, -0.5, 0.5, 0, 200, 0)
+shadow_enabled = true
+
+[node name="Ground" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 0)
+collision_layer = 1
+collision_mask = 0
+
+[node name="Mesh" type="MeshInstance3D" parent="Ground"]
+mesh = SubResource("Mesh_ground")
+surface_material_override/0 = SubResource("Mat_ground")
+
+[node name="Shape" type="CollisionShape3D" parent="Ground"]
+shape = SubResource("Shape_ground")
+
+[node name="Ramp" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.9848, 0.1736, 0, -0.1736, 0.9848, 0, 0.55, -20)
+collision_layer = 1
+collision_mask = 0
+
+[node name="Mesh" type="MeshInstance3D" parent="Ramp"]
+mesh = SubResource("Mesh_ramp")
+surface_material_override/0 = SubResource("Mat_ramp")
+
+[node name="Shape" type="CollisionShape3D" parent="Ramp"]
+shape = SubResource("Shape_ramp")
+
+[node name="Curb" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 8, 0.1, -12)
+collision_layer = 1
+collision_mask = 0
+
+[node name="Mesh" type="MeshInstance3D" parent="Curb"]
+transform = Transform3D(1, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0)
+mesh = SubResource("Mesh_ramp")
+surface_material_override/0 = SubResource("Mat_ramp")
+
+[node name="Shape" type="CollisionShape3D" parent="Curb"]
+transform = Transform3D(1, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0)
+shape = SubResource("Shape_ramp")
+
+[node name="Rover" type="Node3D" parent="."]
+script = ExtResource("1_rover")
+control_source = 1
+terrain_following = true
+ground_collision_mask = 1
+
+[node name="ViewCamera" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 3, 8)
+script = ExtResource("2_cam")
+distance = 7.0
+pitch_deg = 14.0
+enable_input = false
+allow_ground_move = false
