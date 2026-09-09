@@ -913,6 +913,72 @@ func _test_metadata_failure_is_reported_once_without_credentials() -> void:
 			"metadata HTTP failures report actionable credential-safe diagnostics once")
 
 
+func _test_payload_failure_is_reported_once_without_credentials() -> void:
+	var safe_url := "https://synthetic.test/failed-payload.glb"
+	var credentialed_url := safe_url + "?access_token=PAYLOAD_SECRET&session=PAYLOAD_PRIVATE"
+	var streamer := _new_streamer(_document(
+			_content_tile("unused-payload-failure.glb", _anchor_ecef)))
+	streamer.responses[safe_url] = {"__status": 503}
+	var snapshot := _snapshot(streamer, 1)
+
+	for unused in 2:
+		streamer._fetch_content(
+				credentialed_url, _id("failed-payload.glb"), Transform3D.IDENTITY,
+				_sphere(_anchor_ecef), {"center": Vector3.ZERO, "radius": 25.0},
+				"", snapshot)
+	var diagnostic := ""
+	if streamer.reported_errors.size() == 1:
+		diagnostic = streamer.reported_errors[0]
+	_check(streamer.reported_errors.size() == 1
+			and "tile payload" in diagnostic
+			and "HTTP 503" in diagnostic
+			and "PAYLOAD_SECRET" not in diagnostic
+			and "PAYLOAD_PRIVATE" not in diagnostic
+			and safe_url not in diagnostic,
+			"repeated payload HTTP failures reach one actionable credential-safe diagnostic")
+
+
+func _test_local_payloads_precede_distant_visible_payloads() -> void:
+	var far_a_ecef := _anchor_ecef + Vector3(0.0, 7000.0, 0.0)
+	var far_b_ecef := _anchor_ecef + Vector3(0.0, 6000.0, 0.0)
+	var local_a_ecef := _anchor_ecef + Vector3(0.0, 200.0, 0.0)
+	var local_b_ecef := _anchor_ecef + Vector3(0.0, 100.0, 0.0)
+	var root_tile := _contentless_tile(_anchor_ecef, 0.0, [
+		_content_tile("order-far-a.glb", far_a_ecef),
+		_content_tile("order-far-b.glb", far_b_ecef),
+		_content_tile("order-local-a.glb", local_a_ecef),
+		_content_tile("order-local-b.glb", local_b_ecef),
+	])
+	var streamer := _new_streamer(_document(root_tile), 4, 4)
+	_serve_content(streamer, [
+		"order-far-a.glb", "order-far-b.glb",
+		"order-local-a.glb", "order-local-b.glb",
+	])
+	var far_local: Vector3 = GWTiles3DTraversal.bounding_sphere(
+			_sphere(far_a_ecef), Transform3D.IDENTITY, 0.0, 0.0, 0.0)["center"]
+	var snapshot := _snapshot(streamer, 1, [_view(far_local)])
+	snapshot["local_radius"] = 500.0
+	snapshot["local_center"] = Vector3(0.0, 10000.0, 0.0)
+	streamer._run_selection(snapshot)
+
+	var payload_order := PackedStringArray()
+	for url in streamer.request_urls:
+		if String(url).ends_with(".glb"):
+			payload_order.append(String(url).get_file())
+	var admission_order := PackedStringArray()
+	for tile in streamer._pending_results:
+		admission_order.append(String(tile["id"]))
+	_check(payload_order == PackedStringArray([
+				"order-local-a.glb", "order-local-b.glb",
+				"order-far-a.glb", "order-far-b.glb",
+			])
+			and admission_order == PackedStringArray([
+				_id("order-local-a.glb"), _id("order-local-b.glb"),
+				_id("order-far-a.glb"), _id("order-far-b.glb"),
+			]),
+			"local coarse payloads are fetched and admitted first without disturbing provider order within either class")
+
+
 func _test_camera_offsets_are_snapshotted() -> void:
 	var streamer := _new_streamer(_document(
 			_content_tile("unused-camera.glb", _anchor_ecef)))
@@ -991,6 +1057,8 @@ func _run() -> void:
 	_test_sequential_external_instances_survive_cycle_guard()
 	_test_transformed_external_document_cycle_is_rejected()
 	_test_metadata_failure_is_reported_once_without_credentials()
+	_test_payload_failure_is_reported_once_without_credentials()
+	_test_local_payloads_precede_distant_visible_payloads()
 	_test_camera_offsets_are_snapshotted()
 	_test_payload_scheduler_yields_only_to_real_target_changes()
 

@@ -392,6 +392,11 @@ ancestor fallback is visible; without one, complete descendants provide the
 coverage instead.
 New coarse coverage does not discard detail that is already visible. Changed
 camera targets interrupt the old payload queue after a small progress batch.
+Local-safety payloads are requested before distant-only payloads, preserving
+selection order within each class. Metadata and payload request failures share
+throttled, credential-safe engine diagnostics.
+The local-safety footprint is horizontal, so flight altitude does not remove
+the ground beneath the vehicle from selection.
 
 `max_tiles_loaded` bounds resident tile instances (default 1536), and
 `tiles_per_frame_budget` bounds main-thread tile placement per frame (default

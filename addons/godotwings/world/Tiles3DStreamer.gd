@@ -179,7 +179,7 @@ var _tileset_root_url := ""
 var _is_google := false
 var _document_cache: Dictionary = {}
 var _selection_budget_exhausted := false
-var _next_metadata_failure_report_msec := 0
+var _next_request_failure_report_msec := 0
 
 
 ## Configure every render camera that must participate in selection. Weak
@@ -837,17 +837,17 @@ func _post_info(info: Dictionary) -> void:
 	_mutex.unlock()
 
 
-func _report_metadata_failure(tileset_url: String, response: Dictionary) -> void:
+func _report_request_failure(resource_kind: String, resource_url: String,
+		response: Dictionary) -> void:
 	var now := Time.get_ticks_msec()
-	if now < _next_metadata_failure_report_msec:
+	if now < _next_request_failure_report_msec:
 		return
-	_next_metadata_failure_report_msec = now + 5000
-	var document_id := tileset_url.split("?", true, 1)[0].sha256_text().substr(0, 12)
+	_next_request_failure_report_msec = now + 5000
+	var resource_id := resource_url.split("?", true, 1)[0].sha256_text().substr(0, 12)
 	var status := int(response.get("status", 0))
-	var reason := "HTTP %d" % status if status > 0 else String(
-			response.get("error", "transport error"))
-	_post_info({"error": "GWTiles3DStreamer: external tileset metadata request failed (%s, document %s); check network access and Cesium ion credentials/session."
-			% [reason, document_id]})
+	var reason := "HTTP %d" % status if status > 0 else "transport error"
+	_post_info({"error": "GWTiles3DStreamer: %s request failed (%s, resource %s); check network access and Cesium ion credentials/session."
+			% [resource_kind, reason, resource_id]})
 
 ## Returns {"ok": bool, "tileset_url": String, "auth_query": String,
 ## "attributions": Array, "is_google": bool} -- same two response shapes
@@ -979,23 +979,28 @@ func _publish_selection(snapshot: Dictionary, desired: Dictionary,
 
 func _download_selection(desired: Dictionary, snapshot: Dictionary, sent: Dictionary) -> void:
 	var attempted := 0
-	for id in desired:
-		if sent.has(id):
-			continue
-		# Yield at backpressure; the admitted plan is already independently
-		# available to the main thread. A later snapshot resumes missing data.
-		_mutex.lock()
-		var full := _pending_results.size() >= MAX_PENDING_RESULTS
-		var superseded := _target_change_revision > int(snapshot["view_revision"])
-		_mutex.unlock()
-		if full or (superseded and attempted >= 4) or not _thread_running():
-			return
-		var request: Dictionary = desired[id]
-		if _fetch_content(request["url"], id, request["transform"],
-				request["bounding_volume"], request["bounds"],
-				request["pending_parent"], snapshot):
-			sent[id] = true
-		attempted += 1
+	# Preserve provider order within each class while admitting local safety and
+	# collision coverage before payloads needed only by a distant camera view.
+	for priority in 2:
+		for id in desired:
+			if sent.has(id):
+				continue
+			var request: Dictionary = desired[id]
+			if _bounds_intersect_local(request["bounds"], snapshot) != (priority == 0):
+				continue
+			# Yield at backpressure; the admitted plan is already independently
+			# available to the main thread. A later snapshot resumes missing data.
+			_mutex.lock()
+			var full := _pending_results.size() >= MAX_PENDING_RESULTS
+			var superseded := _target_change_revision > int(snapshot["view_revision"])
+			_mutex.unlock()
+			if full or (superseded and attempted >= 4) or not _thread_running():
+				return
+			if _fetch_content(request["url"], id, request["transform"],
+					request["bounding_volume"], request["bounds"],
+					request["pending_parent"], snapshot):
+				sent[id] = true
+			attempted += 1
 
 
 func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapshot: Dictionary,
@@ -1019,7 +1024,7 @@ func _walk_tileset_live(tileset_url: String, base_transform: Transform3D, snapsh
 			if int(resp.get("status", 0)) in [400, 401, 403]:
 				_document_cache.clear()
 			if _thread_running():
-				_report_metadata_failure(tileset_url, resp)
+				_report_request_failure("external tileset metadata", tileset_url, resp)
 			active_documents.erase(document_uri)
 			return {"ok": false, "complete": false, "coverage": PackedStringArray()}
 		doc = JSON.parse_string((resp["body"] as PackedByteArray).get_string_from_utf8())
@@ -1053,9 +1058,7 @@ func _walk_tile_live(tile: Dictionary, parent_transform: Transform3D, base_url: 
 		transform = parent_transform * GWTiles3DTraversal.parse_gltf_transform(tile["transform"])
 	var bounds := GWTiles3DTraversal.bounding_sphere(tile.get("boundingVolume", {}), transform,
 			snapshot["anchor_lat"], snapshot["anchor_lon"], snapshot["anchor_alt"])
-	var local_distance := maxf((bounds["center"] as Vector3).distance_to(
-			snapshot["local_center"]) - float(bounds["radius"]), 0.0)
-	var local_needed := local_distance <= float(snapshot["local_radius"])
+	var local_needed := _bounds_intersect_local(bounds, snapshot)
 	var visible := false
 	for view in snapshot["views"]:
 		var camera_distance := maxf((bounds["center"] as Vector3).distance_to(
@@ -1171,6 +1174,12 @@ func _walk_tile_live(tile: Dictionary, parent_transform: Transform3D, base_url: 
 	return {"ok": true, "complete": true, "coverage": child_coverage}
 
 
+
+static func _bounds_intersect_local(bounds: Dictionary, snapshot: Dictionary) -> bool:
+	var delta: Vector3 = (bounds["center"] as Vector3) - (snapshot["local_center"] as Vector3)
+	var reach := float(snapshot["local_radius"]) + float(bounds["radius"])
+	return delta.x * delta.x + delta.z * delta.z <= reach * reach
+
 static func _rollback_refinement(desired: Dictionary, keep_count: int,
 		transitions: Array, keep_transitions: int) -> void:
 	var ids := desired.keys()
@@ -1196,6 +1205,8 @@ func _fetch_content(content_url: String, id: String, transform: Transform3D,
 	if not resp["ok"]:
 		if int(resp.get("status", 0)) in [400, 401, 403]:
 			_document_cache.clear()
+		if _thread_running():
+			_report_request_failure("tile payload", content_url, resp)
 		return false
 	var data := GWTiles3DTraversal.unwrap_b3dm(resp["body"])
 	if data.size() < 4 or data.slice(0, 4).get_string_from_ascii() != "glTF":
