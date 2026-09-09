@@ -18,6 +18,7 @@ func _initialize() -> void:
 	await _test_model_standard()
 	await _test_slope_hold()
 	await _test_buried_by_streamed_terrain()
+	await _test_settle_on_ground()
 	print("test_rover_model: ", "PASS" if _ok else "FAIL")
 	quit(0 if _ok else 1)
 
@@ -261,4 +262,46 @@ func _test_buried_by_streamed_terrain() -> void:
 			contacts += 1
 	_check(contacts == 4 and not r._crashed, "all wheels on the new surface, no crash")
 	r.queue_free(); tile.queue_free(); ground.queue_free()
+	await physics_frame
+
+
+# --- host-driven re-seat onto terrain that arrived after spawn (any vehicle) -------
+func _test_settle_on_ground() -> void:
+	print("[settle_on_ground]")
+	var ground := _flat_ground()
+	get_root().add_child(ground)
+	await physics_frame
+	await physics_frame
+	var plane := GWFlightBody.new()
+	plane.config = load("res://addons/godotwings/aircraft/Skywalker.tres")
+	plane.control_source = GWVehicleBody.ControlSource.MANUAL
+	plane.terrain_following = true
+	plane.ground_collision_mask = 1
+	plane.spawn_heading = 1.0
+	get_root().add_child(plane)
+	await physics_frame
+	# Freeze the FDM: with a live command source the plane's own ground logic
+	# would re-seat it on the next tick and there would be nothing left to test.
+	(plane.get_node("GWManualInput") as GWManualInput).enabled = false
+	var before := -plane._pos_ned.z
+	var tile := StaticBody3D.new()
+	tile.collision_layer = 1
+	var cs := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(40.0, 0.5, 40.0)
+	cs.shape = box
+	tile.add_child(cs)
+	tile.position = Vector3(0.0, 3.0, 0.0)
+	get_root().add_child(tile)
+	await physics_frame
+	await physics_frame
+	_check(plane.settle_on_ground(), "a parked plane re-seats when ground appears above it")
+	var after := -plane._pos_ned.z
+	_check(absf(after - (3.25 + plane.spawn_altitude)) < 0.05 and plane._on_ground,
+			"it rests on the new surface (%.2f -> %.2f m)" % [before, after])
+	_check(absf(GWCoordConvert.dcm_to_ned_attitude(plane._dcm)[2] - 1.0) < 1e-3, "heading kept")
+	_check(not plane.settle_on_ground(), "a second call is a no-op")
+	plane._vel_ned = Vector3(5.0, 0.0, 0.0)
+	_check(not plane.settle_on_ground(), "a moving vehicle is left alone")
+	plane.queue_free(); tile.queue_free(); ground.queue_free()
 	await physics_frame

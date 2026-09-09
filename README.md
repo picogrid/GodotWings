@@ -133,6 +133,9 @@ the roll stick steers.
 
 ### Rover model standard (glTF)
 
+Step-by-step Blender instructions, with what the sim reads from the model and
+what still comes from the config, are in [docs/rover_model.md](docs/rover_model.md).
+
 Drop any glTF into `model_scene` and, with `geometry_from_model` on (default),
 the sim reads the vehicle from it and animates the wheels — steer, roll and
 suspension travel — instead of you typing the geometry twice. Name the nodes:

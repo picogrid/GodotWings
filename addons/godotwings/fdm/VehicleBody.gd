@@ -292,6 +292,32 @@ func launch(speed: float) -> void:
 		took_off.emit()
 
 
+## Re-seat a parked vehicle on whatever ground is under it now: re-probe the
+## terrain and rest at `spawn_altitude` above it, level, keeping the heading
+## and the simulation clock. For a host that spawns vehicles before streamed
+## terrain (Cesium tiles) has arrived and wants them on the real surface once
+## it has, rather than on the flat fallback beneath it. A no-op while airborne,
+## moving, crashed, ragdolling or held on a launcher. Returns true if it moved.
+func settle_on_ground() -> bool:
+	if _crashed or _ragdolling or _held or not _on_ground:
+		return false
+	if _vel_ned.length() > 0.2 or _omega.length() > 0.2:
+		return false
+	_update_ground_sample()
+	var target_z := _ground_down - spawn_altitude
+	if absf(target_z - _pos_ned.z) < 0.05:
+		return false
+	_pos_ned.z = target_z
+	_vel_ned = Vector3.ZERO
+	_omega = Vector3.ZERO
+	var yaw: float = GWCoordConvert.dcm_to_ned_attitude(_dcm)[2]
+	_dcm = GWCoordConvert.attitude_to_dcm(0.0, 0.0, yaw)
+	_accel_body = Vector3(0, 0, -G)
+	_reset_dynamics()
+	_sync_node()
+	return true
+
+
 ## Advance the simulation by `dt` using fixed internal sub-steps, so behaviour is
 ## identical regardless of the host physics tick rate — total advanced time stays
 ## `dt`, only the integration granularity is fixed.
