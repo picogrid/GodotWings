@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Launch ArduPlane SITL wired to GodotWings (JSON physics) and a GCS (MAVLink).
+# Launch ArduPilot SITL (Plane / Copter / Rover) wired to GodotWings (JSON physics)
+# and a GCS (MAVLink).
 #
 # Env vars (all optional, sensible defaults):
 #   GODOT_HOST     host running GodotWings' SITL bridge (listens on UDP 9002)
@@ -9,12 +10,14 @@
 #   SPEEDUP        sim speed multiplier (lockstep with Godot pins this to ~1)
 #   MAVPROXY_DAEMON  "true" = headless (no console); default "false" = interactive
 #                    MAVProxy console (attach with `docker attach godotwings-sitl`)
-#   VEHICLE        ArduPlane (default) or ArduCopter — both binaries are built in
-#                  the image. Match the Godot side (GWAircraft vs a multirotor).
+#   VEHICLE        ArduPlane (default), ArduCopter or Rover — all three binaries are
+#                  built in the image. Match the Godot side (GWAircraft /
+#                  GWMulticopter / GWRover).
 #   NUM_VEHICLES   how many aircraft to spawn (default 1). Vehicle i uses ArduPilot
 #                  instance -I i -> JSON physics on 9002+10*i (match a GWAircraft
 #                  with sitl_instance=i) and MAVLink out to GCS_PORT+10*i.
-#   PARAM_FILE     extra param file applied on boot (default /sitl-defaults.parm)
+#   PARAM_FILE     extra param file applied on boot (default /sitl-defaults.parm,
+#                  or /sitl-rover.parm when VEHICLE=Rover)
 #   EXTRA_ARGS     appended verbatim to sim_vehicle.py
 set -euo pipefail
 
@@ -26,7 +29,13 @@ SPEEDUP="${SPEEDUP:-1}"
 MAVPROXY_DAEMON="${MAVPROXY_DAEMON:-false}"
 VEHICLE="${VEHICLE:-ArduPlane}"
 NUM_VEHICLES="${NUM_VEHICLES:-1}"
-PARAM_FILE="${PARAM_FILE:-/sitl-defaults.parm}"
+# Rover has its own defaults: the copter FRAME_CLASS/FRAME_TYPE in the shared file
+# mean something else to ArduRover (omni frames) and would break its steering.
+case "${VEHICLE}" in
+    Rover|rover|ArduRover|ardurover) DEFAULT_PARAMS=/sitl-rover.parm ;;
+    *) DEFAULT_PARAMS=/sitl-defaults.parm ;;
+esac
+PARAM_FILE="${PARAM_FILE:-${DEFAULT_PARAMS}}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Resolve a hostname to an IPv4 literal. ArduPilot's JSON frame is `:`-delimited

@@ -1,4 +1,4 @@
-# ArduPilot SITL for GodotWings (ArduPlane or ArduCopter).
+# ArduPilot SITL for GodotWings (ArduPlane, ArduCopter or Rover).
 #
 #   1. Open the GodotWings project in Godot and press Play (binds UDP 9002).
 #   2. docker compose up --build      (first build is slow: compiles ArduPilot)
@@ -23,7 +23,8 @@ services:
       GCS_PORT: ${GCS_PORT:-14550}
       HOME_LOCATION: ${HOME_LOCATION:-60.221088825593135,25.018208331290666,0,90}
       SPEEDUP: ${SPEEDUP:-1}
-      # ArduPlane (default) or ArduCopter — match the Godot vehicle you fly.
+      # ArduPlane (default), ArduCopter or Rover — match the Godot vehicle
+      # (GWAircraft / GWMulticopter / GWRover).
       VEHICLE: ${VEHICLE:-ArduPlane}
       # Number of aircraft to spawn. Vehicle i uses ArduPilot -I i -> JSON physics
       # on 9002+10*i (match a GWAircraft with sitl_instance=i) and MAVLink to

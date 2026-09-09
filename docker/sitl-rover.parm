@@ -1,0 +1,75 @@
+# GodotWings SITL convenience defaults for ArduRover (used automatically when
+# VEHICLE=Rover; the shared sitl-defaults.parm carries copter FRAME_* values that
+# mean omni frames to Rover). Edit freely; re-run `docker compose up` to apply.
+
+# Arm from a GCS without an RC transmitter / with a custom physics backend.
+ARMING_CHECK 0
+ARMING_RUDDER 2
+FS_THR_ENABLE 0
+FS_GCS_ENABLE 0
+
+# --- Frame: a plain steered/skid rover, not an omni frame -----------------------
+FRAME_CLASS 1
+FRAME_TYPE 0
+
+# --- Outputs the Godot GWRoverBody reads ------------------------------------------
+# Ackermann (default): channel 1 = ground steering (1500 centre, + = right),
+# channel 3 = throttle (1500 stop, 2000 full forward, 1000 full reverse).
+SERVO1_FUNCTION 26     # GroundSteering
+SERVO3_FUNCTION 70     # Throttle
+# Skid steering instead (GWRoverConfig.steering_mode = SKID): channel 1 = left
+# side, channel 3 = right side. Uncomment these two and the frame keeps working.
+#SERVO1_FUNCTION 73    # ThrottleLeft
+#SERVO3_FUNCTION 74    # ThrottleRight
+MOT_PWM_TYPE 0
+
+# --- Speed / steering tune matched to the bundled Rover4WD.tres --------------------
+# 6 m/s no-load top speed, ~5.6 m/s achieved; 30 deg full lock on a 0.9 m
+# wheelbase = 1.56 m minimum turn radius. Cruise at half throttle.
+CRUISE_SPEED 3.0
+CRUISE_THROTTLE 45
+WP_SPEED 3.0
+ATC_ACCEL_MAX 2.0
+ATC_DECEL_MAX 3.0
+ATC_SPEED_P 0.25
+ATC_SPEED_I 0.25
+ATC_STR_RAT_MAX 150
+ATC_STR_RAT_P 0.3
+ATC_STR_RAT_I 0.2
+ATC_STR_RAT_FF 0.25
+ATC_STR_ANG_P 2.5
+TURN_RADIUS 1.6
+MOT_SLEWRATE 100
+MOT_THR_MIN 0
+
+# --- Aux RC passthrough on the spare outputs (same as the plane/copter file) ------
+SERVO5_FUNCTION  55
+SERVO6_FUNCTION  56
+SERVO7_FUNCTION  57
+SERVO8_FUNCTION  58
+SERVO12_FUNCTION 62
+SERVO13_FUNCTION 63
+SERVO14_FUNCTION 64
+SERVO15_FUNCTION 65
+SERVO16_FUNCTION 66
+
+# --- Camera gimbal: servo mount that the Godot GWCamera follows -------------------
+# Same block as sitl-defaults.parm: enable camera_gimbal on the GWRover and set
+# pitch/yaw/roll channels to 9/10/11 with the ranges below.
+MNT1_TYPE        1
+MNT1_DEFLT_MODE  2
+SERVO9_FUNCTION  7
+SERVO10_FUNCTION 6
+SERVO11_FUNCTION 8
+SERVO9_MIN  1000
+SERVO9_MAX  2000
+SERVO10_MIN 1000
+SERVO10_MAX 2000
+SERVO11_MIN 1000
+SERVO11_MAX 2000
+MNT1_PITCH_MIN -90
+MNT1_PITCH_MAX 0
+MNT1_YAW_MIN  -180
+MNT1_YAW_MAX   180
+MNT1_ROLL_MIN -30
+MNT1_ROLL_MAX  30
