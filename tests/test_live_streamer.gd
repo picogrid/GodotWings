@@ -39,6 +39,10 @@ class SyntheticStreamer extends GWTiles3DStreamer:
 		if not responses.has(response_key):
 			return {"ok": false, "status": 404}
 		var response = responses[response_key]
+		if response is Array:
+			if response.is_empty():
+				return {"ok": false, "status": 404}
+			response = response.pop_front()
 		if response is Dictionary and response.has("__status"):
 			return {"ok": false, "status": int(response["__status"])}
 		if response is PackedByteArray:
@@ -392,6 +396,10 @@ func _test_later_phase_zero_retains_visible_detail() -> void:
 	if not streamer._pending_plans.has(4):
 		return
 	var phase_zero: Dictionary = streamer._pending_plans[4]
+	_check(streamer._pending_plans.has(5),
+			"a later view publishes its detailed control plan")
+	if not streamer._pending_plans.has(5):
+		return
 	var phase_one: Dictionary = streamer._pending_plans[5]
 	_check(streamer._pending_results.size() == 2
 			and streamer._pending_results[0]["id"] == _id("later-parent.glb"),
@@ -408,6 +416,51 @@ func _test_later_phase_zero_retains_visible_detail() -> void:
 	streamer._drain_results()
 	_check(not _is_visible(streamer, first_parent) and not _is_visible(streamer, first_fine),
 			"only authoritative phase one retires the prior off-view cut")
+
+func _test_repeated_coarse_only_plans_replace_prior_admission() -> void:
+	var initial_root := _content_tile("retained-parent.glb", _anchor_ecef, 100.0, [
+		_content_tile("retained-fine.glb", _anchor_ecef),
+	])
+	var streamer := _new_streamer(_document(initial_root), 3, 3)
+	_serve_content(streamer, ["retained-parent.glb", "retained-fine.glb"])
+	_run_and_drain(streamer, 1, [_view(Vector3.FORWARD)])
+
+	var fine_id := _id("retained-fine.glb")
+	var coarse_ids := PackedStringArray()
+	var only_coarse_plans := true
+	for revision in range(2, 4):
+		var coarse_path := "coarse-only-%d.glb" % revision
+		var rejected_path := "coarse-rejected-%d.glb" % revision
+		var coarse_root := {
+			"boundingVolume": _sphere(_anchor_ecef),
+			"geometricError": 0.0,
+			"contents": [{"uri": coarse_path}, {"uri": rejected_path}],
+		}
+		# The first coarse payload is available, but the following auth failure
+		# invalidates metadata. The detailed pass then legitimately fails its
+		# root refetch, leaving phase zero as the newest authoritative plan.
+		streamer._document_cache.clear()
+		streamer.responses[ROOT_URL] = [
+			_document(coarse_root),
+			{"__status": 503},
+		]
+		streamer.responses["https://synthetic.test/" + coarse_path] = GLTF_SENTINEL
+		streamer.responses["https://synthetic.test/" + rejected_path] = {"__status": 403}
+		streamer._run_selection(_snapshot(streamer, revision, [_view(Vector3.FORWARD)]))
+		only_coarse_plans = only_coarse_plans \
+				and streamer._pending_plans.has(revision * 2) \
+				and not streamer._pending_plans.has(revision * 2 + 1)
+		streamer._drain_results()
+		coarse_ids.append(_id(coarse_path))
+
+	_check(only_coarse_plans,
+			"payload auth failures publish coarse control without a detailed plan")
+	_check(_is_visible(streamer, fine_id)
+			and not streamer._loaded_tiles.has(coarse_ids[0])
+			and _is_visible(streamer, coarse_ids[1])
+			and streamer._loaded_tiles.size() == 3,
+			"latest coarse admission replaces stale coarse residency while fine coverage stays visible")
+
 
 
 func _many_content_fixture(count: int) -> Dictionary:
@@ -722,6 +775,7 @@ func _run() -> void:
 	_test_contentless_root_does_not_force_offscreen_children()
 	_test_budget_prioritizes_high_sse_branch()
 	_test_later_phase_zero_retains_visible_detail()
+	_test_repeated_coarse_only_plans_replace_prior_admission()
 	_test_queue_pressure_and_budget_rollback()
 	_test_completed_older_snapshot_is_accepted()
 	_test_failed_payloads_preserve_nested_fallbacks()

@@ -144,7 +144,8 @@ var _incoming_tiles: Array = []
 var _replacement_groups: Dictionary = {}
 var _parent_groups: Dictionary = {}
 var _current_desired_ids: Dictionary = {}
-var _current_coverage_ids := PackedStringArray()
+var _accepted_fine_desired_ids: Dictionary = {}
+var _protected_tile_ids: Dictionary = {}
 
 var _thread: Thread
 var _mutex: Mutex
@@ -435,14 +436,19 @@ func _incoming_has(id: String) -> bool:
 
 
 func _tile_needed(id: String) -> bool:
-	if _current_desired_ids.has(id):
-		return true
-	for group in _replacement_groups.values():
-		if (group.get("promoted", false) \
-				or int(group.get("selected_revision", -1)) == _accepted_view_revision) \
-				and (id in group["parent_ids"] or id in group["required_ids"]):
-			return true
-	return false
+	return _current_desired_ids.has(id) or _protected_tile_ids.has(id)
+
+
+func _rebuild_protected_tile_ids() -> void:
+	_protected_tile_ids.clear()
+	for group_id in _replacement_groups:
+		var group: Dictionary = _replacement_groups[group_id]
+		if group.get("promoted", false) \
+				or int(group.get("selected_revision", -1)) == _accepted_view_revision:
+			for id in group["parent_ids"]:
+				_protected_tile_ids[String(id)] = true
+			for id in group["required_ids"]:
+				_protected_tile_ids[String(id)] = true
 
 
 func _make_room_for_tile() -> bool:
@@ -594,20 +600,21 @@ func _apply_selection(event: Dictionary) -> void:
 	if int(event.get("phase", 1)) == 0:
 		# A new view can acquire coarse coverage while its detail is planned,
 		# without coarsening or evicting the already visible replacement cut.
+		_current_desired_ids.clear()
+		_current_desired_ids.merge(_accepted_fine_desired_ids, true)
 		for id in event["desired_ids"]:
 			_current_desired_ids[String(id)] = true
-		for id in event.get("coverage_ids", []):
-			if String(id) not in _current_coverage_ids:
-				_current_coverage_ids.append(String(id))
 		for group in _replacement_groups.values():
 			if int(group.get("selected_revision", -1)) >= 0:
 				group["selected_revision"] = _accepted_view_revision
 		_try_all_promotions()
+		_rebuild_protected_tile_ids()
 		return
-	_current_desired_ids.clear()
+	_accepted_fine_desired_ids.clear()
 	for id in event["desired_ids"]:
-		_current_desired_ids[String(id)] = true
-	_current_coverage_ids = PackedStringArray(event.get("coverage_ids", []))
+		_accepted_fine_desired_ids[String(id)] = true
+	_current_desired_ids.clear()
+	_current_desired_ids.merge(_accepted_fine_desired_ids, true)
 	var selected_groups := {}
 	for transition in event.get("transitions", []):
 		var parent_ids := PackedStringArray(transition.get("parent_ids", []))
@@ -647,6 +654,7 @@ func _apply_selection(event: Dictionary) -> void:
 			_hide_coverage(String(child_id))
 
 	_try_all_promotions()
+	_rebuild_protected_tile_ids()
 
 
 func _evict_safe_cached_tiles() -> void:
@@ -880,22 +888,21 @@ func _run_selection(snapshot: Dictionary) -> void:
 	var sent := {}
 	for id in snapshot["known_ids"]:
 		sent[String(id)] = true
-	_publish_selection(snapshot, desired, coarse["coverage"], transitions, 0)
+	_publish_selection(snapshot, desired, transitions, 0)
 	_download_selection(desired, snapshot, sent)
 	active_documents.clear()
 	var detailed := _walk_tileset_live(_tileset_root_url, Transform3D.IDENTITY, snapshot,
 			desired, active_documents, "", max_tiles_loaded, true, false, transitions)
 	if detailed["ok"] and detailed["complete"] and _thread_running():
-		_publish_selection(snapshot, desired, detailed["coverage"], transitions, 1)
+		_publish_selection(snapshot, desired, transitions, 1)
 		_download_selection(desired, snapshot, sent)
 
 
 func _publish_selection(snapshot: Dictionary, desired: Dictionary,
-		coverage: PackedStringArray, transitions: Array, phase: int) -> void:
+		transitions: Array, phase: int) -> void:
 	_post_plan({
 		"kind": "plan", "phase": phase,
 		"desired_ids": PackedStringArray(desired.keys()),
-		"coverage_ids": coverage,
 		"transitions": transitions.duplicate(true),
 		"generation": snapshot["generation"],
 		"view_revision": snapshot["view_revision"],
