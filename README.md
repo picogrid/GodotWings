@@ -39,6 +39,15 @@ VEHICLE=ArduCopter docker compose up --build  # ArduCopter for GWMulticopter
 VEHICLE=Rover docker compose up --build       # ArduRover for GWRover
 ```
 
+Sim time tracks the wall clock through the lockstep: each physics tick waits
+briefly (`GWSITLBridge.wait_command`) for ArduPilot's reply to the state it
+just posted, because Godot runs a frame's ticks back to back and would
+otherwise complete one exchange per RENDERED frame — sim time then runs at
+`render_fps / control_rate_hz` of realtime, which for a copter's 400 Hz loop
+is a third or less and reads as a sluggish, slow-motion aircraft. The wait
+returns at once when SITL never connected or has gone quiet, so an idle scene
+costs nothing.
+
 **Start Godot before the container** — ArduPilot's JSON backend blocks waiting for physics and emits no MAVLink until Godot is replying. If the container starts
 first, `docker compose restart ardupilot-sitl` once Godot is running.
 

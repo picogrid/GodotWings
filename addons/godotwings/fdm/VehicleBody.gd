@@ -240,8 +240,16 @@ func _reset_state() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if _source == null or not _source.has_command():
-		return # SITL: advance only when ArduPilot has sent PWM. MANUAL: every tick.
+	if _source == null:
+		return
+	if not _source.has_command():
+		# SITL lockstep: ArduPilot's reply lands ~RTT after post_state -- a
+		# back-to-back tick burst would miss it every time and the exchange
+		# rate collapses to one per rendered frame (sim at fps/control_rate of
+		# realtime). Wait for it inside the tick instead. MANUAL input (no
+		# wait_command) keeps the old advance-every-tick.
+		if not (_source.has_method("wait_command") and _source.wait_command()):
+			return
 	_cmd = _source.take_command()
 	_update_controls(_cmd["pwm"])
 	if _cmd["reset"]:
